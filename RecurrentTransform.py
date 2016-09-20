@@ -10,7 +10,7 @@ from ActivationFunctions import elu
 
 class RecurrentTransformBase(object):
   name = None
-
+#UMA
   def __init__(self, force_gpu=False, layer=None, for_custom=False):
     """
     :type layer: NetworkRecurrentLayer.RecurrentUnitLayer
