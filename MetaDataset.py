@@ -1,4 +1,6 @@
 
+from __future__ import print_function
+
 from Dataset import Dataset, DatasetSeq, init_dataset, convert_data_dims
 from CachedDataset2 import CachedDataset2
 from Util import NumbersDict, load_json
@@ -223,13 +225,13 @@ class ClusteringDataset(CachedDataset2):
     from EngineBatch import Batch
     batch = Batch()
     last_seq_idx = None
-    for seq_idx, t_start, t_end in self._iterate_seqs(chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
+    for seq_idx, t_start, t_end in self.iterate_seqs(chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
       if self.single_cluster:
         if last_seq_idx is not None and last_seq_idx != seq_idx:
           last_seq_name = self.get_tag(last_seq_idx)
           seq_name = self.get_tag(seq_idx)
           if self.cluster_map[last_seq_name] != self.cluster_map[seq_name]:
-            print >> log.v5, "ClusteringDataset::_generate_batches", last_seq_idx, "is not", seq_idx
+            print("ClusteringDataset::_generate_batches", last_seq_idx, "is not", seq_idx, file=log.v5)
             yield batch
             batch = Batch()
       length = t_end - t_start
@@ -238,14 +240,14 @@ class ClusteringDataset(CachedDataset2):
       elif max_seq_length > 0 and length.max_value() > max_seq_length:
         continue
       if length.max_value() > batch_size:
-        print >> log.v4, "warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size)
+        print("warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size), file=log.v4)
       if self.rnd_seq_drop.random() < seq_drop:
         continue
       dt, ds = batch.try_sequence_as_slice(length)
       if ds > 1 and ((dt * ds).max_value() > batch_size or ds > max_seqs):
         yield batch
         batch = Batch()
-      print >> log.v5, "batch add slice length", length
+      print("batch add slice length", length, file=log.v5)
       batch.add_sequence_as_slice(seq_idx=seq_idx, seq_start_frame=t_start, length=length)
       last_seq_idx = seq_idx
 
@@ -410,12 +412,12 @@ class CombinedDataset(CachedDataset2):
     self.datasets = {key: init_dataset(datasets[key]) for key in self.dataset_keys}
 
     try:
-      self._num_seqs = sum([ds.num_seqs for ds in self.datasets.values()])
+      self._num_seqs = sum([self.datasets[k].num_seqs for k in sorted(self.datasets.keys())])
       self.know_num_seqs_beforehand = True
 #      print "Dont need to set estimations for num_seqs. Currently is {s}".format(s=[ds.num_seqs for ds in self.datasets.values()])
-    except:
-      self._estimated_num_seqs = sum([ds.estimated_num_seqs for ds in self.datasets.values()])
-      self.estimated_num_seq_per_subset = [ds.estimated_num_seqs for ds in self.datasets.values()]
+    except Exception:
+      self._estimated_num_seqs = sum([self.datasets[k].estimated_num_seqs for k in sorted(self.datasets.keys())])
+      self.estimated_num_seq_per_subset = [self.datasets[k].estimated_num_seqs for k in sorted(self.datasets.keys())]
 #      TODO this estimate seems broken on a small test corpus; needs further testing
 #      print "Need to set estimations for num_seqs. Currently is {s}".format(s=[ds.estimated_num_seqs for ds in self.datasets.values()])
       self.know_num_seqs_beforehand = False
@@ -492,8 +494,8 @@ class CombinedDataset(CachedDataset2):
 
           if total_remaining < 0.1: # We expect no more data, but try anyway
             nonempty_datasets = []
-            for j,ds in enumerate(self.datasets.values()):
-              if ds.is_less_than_num_seqs(self.used_num_seqs_per_subset[j]):
+            for j,k in enumerate(sorted(self.datasets.keys())):
+              if self.datasets[k].is_less_than_num_seqs(self.used_num_seqs_per_subset[j]):
                 nonempty_datasets.append(j)
             if nonempty_datasets == []:
               return False # No more data to add
@@ -740,7 +742,7 @@ class ChunkShuffleDataset(CachedDataset2):
     # We have reached the end.
     if not self.added_data:
       self._num_seqs = 0
-      print >>log.v3, "warning: empty dataset"
+      print("warning: empty dataset", file=log.v3)
     else:
       self._num_seqs = self.added_data[-1].seq_idx + 1
     self.reached_final_seq = True

@@ -1,5 +1,7 @@
 #! /usr/bin/python2.7
 
+from __future__ import print_function
+
 __author__ = "Patrick Doetsch"
 __copyright__ = "Copyright 2015"
 __credits__ = ["Patrick Doetsch", "Paul Voigtlaender"]
@@ -18,7 +20,7 @@ import theano
 
 from Log import log
 from EngineBatch import Batch, BatchSetGenerator
-from Util import try_run, NumbersDict
+from Util import try_run, NumbersDict, unicode
 
 
 class Dataset(object):
@@ -34,7 +36,8 @@ class Dataset(object):
         del kwargs[key]
       if value is not None and key not in kwargs:
         kwargs[key] = value
-    set_or_remove("window", None)
+    set_or_remove("window", config.int('window', 0) or None)
+    set_or_remove("context_window", config.typed_value("context_window"))
     set_or_remove("chunking", config.value("chunking", None))
     set_or_remove("seq_ordering", config.value("batching", None))
     set_or_remove("shuffle_frames_of_nseqs", config.int('shuffle_frames_of_nseqs', 0) or None)
@@ -49,7 +52,21 @@ class Dataset(object):
     cls.kwargs_update_from_config(config, kwargs)
     return cls(**kwargs)
 
-  def __init__(self, name="dataset", window=1, chunking="0", seq_ordering='default', shuffle_frames_of_nseqs=0, estimated_num_seqs=None):
+  def __init__(self, name="dataset",
+               window=1, context_window=None, chunking="0",
+               seq_ordering='default', shuffle_frames_of_nseqs=0,
+               estimated_num_seqs=None,):
+    """
+    :param str name: e.g. "train" or "eval"
+    :param int window: features will be of dimension window * feature_dim, as we add a context-window around.
+      not all datasets support this option.
+    :param None|int|dict|NumbersDict context_window: will add this context for each chunk
+    :param str chunking: "chunk_size:chunk_step"
+    :param str seq_ordering: "batching"-option in config. e.g. "default", "sorted" or "random".
+      See self.get_seq_order_for_epoch() for more details.
+    :param int shuffle_frames_of_nseqs: shuffles the frames. not always supported
+    :param None|int estimated_num_seqs: for progress reporting in case the real num_seqs is unknown
+    """
     self.name = name
     self.lock = RLock()  # Used when manipulating our data potentially from multiple threads.
     self.num_inputs = 0
@@ -71,20 +88,32 @@ class Dataset(object):
     else:
       self.chunk_step = self.chunk_size
     assert self.chunk_size >= 0, "chunk size must not be negative"
+    if context_window is None:
+      context_window = NumbersDict(0)
+    elif isinstance(context_window, int):
+      context_window = NumbersDict(broadcast_value=0, numbers_dict={"data": context_window})
+    elif isinstance(context_window, dict):
+      context_window = NumbersDict(broadcast_value=0, numbers_dict=context_window)
+    assert isinstance(context_window, NumbersDict)
+    self.context_window = context_window
     self.shuffle_frames_of_nseqs = shuffle_frames_of_nseqs
     self.epoch = None
+
+  def __repr__(self):
+    return "<%s %r>" % (self.__class__.__name__, self.name)
 
   def sliding_window(self, xr):
     """
     :type xr: numpy.ndarray
     :rtype: numpy.ndarray
     """
-    from numpy.lib.stride_tricks import as_strided as ast
+    from numpy.lib.stride_tricks import as_strided
     x = numpy.concatenate([self.zpad, xr, self.zpad])
-    return ast(x,
-               shape=(x.shape[0] - self.window + 1, 1, self.window, self.num_inputs),
-               strides=(x.strides[0], x.strides[1] * self.num_inputs) + x.strides
-               ).reshape((xr.shape[0], self.num_inputs * self.window))
+    return as_strided(
+      x,
+      shape=(x.shape[0] - self.window + 1, 1, self.window, self.num_inputs),
+      strides=(x.strides[0], x.strides[1] * self.num_inputs) + x.strides
+      ).reshape((xr.shape[0], self.num_inputs * self.window))
 
   def preprocess(self, seq):
     """
@@ -100,7 +129,8 @@ class Dataset(object):
     :rtype: bool
     :returns whether we have the full range (start,end) of sorted seq idx.
     """
-    if start == end: return True  # Empty.
+    if start == end:
+      return True  # Empty.
     assert start < end
     return False
 
@@ -189,12 +219,14 @@ class Dataset(object):
 
   def get_seq_order_for_epoch(self, epoch, num_seqs, get_seq_len=None):
     """
-    :returns the order for the given epoch.
+    Returns the order of the given epoch.
     This is mostly a static method, except that is depends on the configured type of ordering,
-     such as 'default' (= as-is), 'sorted' or 'random'. 'sorted' also uses the sequence length.
+    such as 'default' (= as-is), 'sorted' or 'random'. 'sorted' also uses the sequence length.
+
     :param int epoch: for 'random', this determines the random seed
-    :type num_seqs: int
-    :param get_seq_len: function (originalSeqIdx: int) -> int
+    :param int num_seqs:
+    :param ((int) -> int)|None get_seq_len: function (originalSeqIdx: int) -> int
+    :return: the order for the given epoch. such that seq_idx -> underlying idx
     :rtype: list[int]
     """
     assert num_seqs > 0
@@ -209,16 +241,16 @@ class Dataset(object):
       tmp = self.seq_ordering.split(':')
       bins = int(tmp[1]) if len(tmp) > 1 else 2
       nth = int(tmp[2]) if len(tmp) > 2 else 1
-      rnd_seed = ((epoch - 1) / nth + 1) if epoch else 1
+      rnd_seed = ((epoch - 1) // nth + 1) if epoch else 1
       rnd = Random(rnd_seed)
       rnd.shuffle(seq_index)
       out_index = []
-      for i in xrange(bins):
+      for i in range(bins):
         if i == bins - 1:
-          part = seq_index[i * len(seq_index) / bins:]
+          part = seq_index[i * len(seq_index) // bins:]
         else:
-          part = seq_index[i * len(seq_index) / bins:(i + 1) * len(seq_index) / bins]
-        part.sort(key=get_seq_len,reverse=(i%2==1))
+          part = seq_index[i * len(seq_index) // bins:(i + 1) * len(seq_index) // bins]
+        part.sort(key=get_seq_len, reverse=(i%2 == 1))
         out_index += part
       seq_index = out_index
     elif self.seq_ordering.startswith('random'):
@@ -237,7 +269,7 @@ class Dataset(object):
     :type epoch: int|None
     :param list[str] | None seq_list: In case we want to set a predefined order.
     :rtype: bool
-    :returns whether the order changed
+    :returns whether the order changed (True is always safe to return)
 
     This is called when we start a new epoch, or at initialization.
     Call this when you reset the seq list.
@@ -246,11 +278,7 @@ class Dataset(object):
     self.rnd_seq_drop = Random(epoch or 1)
     return False
 
-  def initialize(self):
-    """
-    Does the main initialization before it can be used.
-    This needs to be called before self.load_seqs() can be used.
-    """
+  def _base_init(self):
     # We expect that the following attributes are already set elsewhere, by a derived class.
     assert self.num_inputs > 0
     assert self.num_outputs
@@ -262,8 +290,14 @@ class Dataset(object):
     self.nbytes = numpy.array([], dtype=theano.config.floatX).itemsize * (self.num_inputs * self.window + 1 + 1)
 
     if self.window > 1:
-      self.zpad = numpy.zeros((int(self.window) / 2, self.num_inputs), dtype=theano.config.floatX)
+      self.zpad = numpy.zeros((int(self.window) // 2, self.num_inputs), dtype=theano.config.floatX)
 
+  def initialize(self):
+    """
+    Does the main initialization before it can be used.
+    This needs to be called before self.load_seqs() can be used.
+    """
+    self._base_init()
     self.init_seq_order()
 
   def get_times(self, sorted_seq_idx):
@@ -387,8 +421,9 @@ class Dataset(object):
 
   def get_data_dim(self, key):
     """
-    :type key: str
+    :param str key: e.g. "data" or "classes"
     :return: number of classes, no matter if sparse or not
+    :rtype: int
     """
     if key == "data":
       return self.num_inputs * self.window
@@ -397,11 +432,21 @@ class Dataset(object):
     return 1  # unknown
 
   def get_data_dtype(self, key):
+    """
+    :param str key: e.g. "data" or "classes"
+    :return: dtype as str, e.g. "int32" or "float32"
+    :rtype: str
+    """
     if self.is_data_sparse(key):
       return "int32"
     return "float32"
 
   def is_data_sparse(self, key):
+    """
+    :param str key: e.g. "data" or "classes"
+    :return: whether the data is sparse
+    :rtype: bool
+    """
     if key in self.num_outputs:
       return self.num_outputs[key][1] == 1
     if key == "data":
@@ -411,12 +456,17 @@ class Dataset(object):
   def get_data_shape(self, key):
     """
     :returns get_data(*, key).shape[1:], i.e. num-frames excluded
+    :rtype: list[int]
     """
     if self.is_data_sparse(key):
       return []
     return [self.get_data_dim(key)]
 
   def have_seqs(self):
+    """
+    :return: whether num_seqs > 0
+    :rtype: bool
+    """
     return self.is_less_than_num_seqs(0)
 
   def len_info(self):
@@ -440,6 +490,20 @@ class Dataset(object):
     # in advance can handle this somehow.
     return n < self.num_seqs
 
+  def can_serialize_data(self, key):
+    """
+    :param str key: e.g. "classes"
+    :rtype: bool
+    """
+    return key in self.labels
+
+  def serialize_data(self, key, data):
+    """
+    :param str key: e.g. "classes". self.labels[key] should be set
+    :param numpy.ndarray data: 1D
+    """
+    return " ".join(map(self.labels[key].__getitem__, data))
+
   def calculate_priori(self, target="classes"):
     priori = numpy.zeros((self.num_outputs[target][0],), dtype=theano.config.floatX)
     i = 0
@@ -450,27 +514,28 @@ class Dataset(object):
       i += 1
     return numpy.array(priori / self.get_num_timesteps(), dtype=theano.config.floatX)
 
-  def _iterate_seqs(self, chunk_size, chunk_step, used_data_keys):
+  def iterate_seqs(self, chunk_size=None, chunk_step=None, used_data_keys=None):
     """
     Takes chunking into consideration.
-    :type chunk_size: int
-    :type chunk_step: int
+    :param int chunk_size:
+    :param int chunk_step:
     :param set(str)|None used_data_keys:
-    :return: index, and seq start, seq end
+    :return: generator which yields tuples (seq index, seq start, seq end)
     :rtype: list[(int,NumbersDict,NumbersDict)]
     """
+    if chunk_size is None:
+      chunk_size = self.chunk_size
+    if chunk_step is None:
+      chunk_step = self.chunk_step
     s = 0
     while self.is_less_than_num_seqs(s):
       length = self.get_seq_length(s)
       if chunk_size == 0:
-        yield (s, NumbersDict(0), length)
+        yield (s, length.constant_like(0), length)
       else:
         if used_data_keys is not None:
-          length = length.copy()
-          for key in list(length.keys()):
-            if key not in used_data_keys:
-              del length[key]
-        t = 0
+          length = NumbersDict({k: length[k] for k in used_data_keys})
+        t = length.constant_like(0)
         default_key = "data"
         # There are usually the 'data' (input) and 'classes' (targets) data-keys in `length` but there can be others.
         # We expect them all of the same length so that we can do chunking.
@@ -484,16 +549,50 @@ class Dataset(object):
             keys_with_full_seqs.append(key)
             continue
           raise Exception("Chunking with multiple data-keys of different length: %r" % length)
-        while t < length[default_key]:
-          l = min(t + chunk_size, length[default_key])
+        while t[default_key] < length[default_key]:
           chunk_start = NumbersDict(t)
-          chunk_end = NumbersDict(l)
+          chunk_end = NumbersDict.min([t + chunk_size, length])
           for key in keys_with_full_seqs:
             chunk_start[key] = 0
             chunk_end[key] = length[key]
+          if length.value is None:
+            chunk_start.value = None
+            chunk_end.value = None
           yield (s, chunk_start, chunk_end)
           t += chunk_step
       s += 1
+
+  def _get_context_window_left_right(self):
+    """
+    :return: (ctx_left, ctx_right)
+    :rtype: None|(NumbersDict,NumbersDict)
+    """
+    if self.context_window:
+      # One less because the original frame also counts, and context_window=1 means that we just have that single frame.
+      # ctx_total is how much frames we add additionally.
+      ctx_total = NumbersDict.max([self.context_window, 1]) - 1
+      # In case ctx_total is odd / context_window is even, we have to decide where to put one more frame.
+      # To keep it consistent with e.g. 1D convolution with a kernel of even size, we add one more to the right.
+      # See test_tfconv1d_evensize().
+      ctx_left = ctx_total // 2
+      ctx_right = ctx_total - ctx_left
+      return ctx_left, ctx_right
+    else:
+      return None
+
+  def get_start_end_frames_full_seq(self, seq_idx):
+    """
+    :param int seq_idx:
+    :return: (start,end) frame, taking context_window into account
+    :rtype: (NumbersDict,NumbersDict)
+    """
+    end = self.get_seq_length(seq_idx)
+    start = end.constant_like(0)
+    ctx_lr = self._get_context_window_left_right()
+    if ctx_lr:
+      start -= ctx_lr[0]
+      end += ctx_lr[1]
+    return start, end
 
   def _generate_batches(self, recurrent_net, batch_size, max_seqs=-1, seq_drop=0.0, max_seq_length=sys.maxsize, used_data_keys=None):
     """
@@ -512,10 +611,14 @@ class Dataset(object):
     chunk_step = self.chunk_step
     if not recurrent_net:
       if chunk_size != 0:
-        print >> log.v4, "Non-recurrent network, chunk size %i:%i ignored" % (chunk_size, chunk_step)
+        print("Non-recurrent network, chunk size %i:%i ignored" % (chunk_size, chunk_step), file=log.v4)
         chunk_size = 0
     batch = Batch()
-    for seq_idx, t_start, t_end in self._iterate_seqs(chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
+    ctx_lr = self._get_context_window_left_right()
+    for seq_idx, t_start, t_end in self.iterate_seqs(chunk_size=chunk_size, chunk_step=chunk_step, used_data_keys=used_data_keys):
+      if ctx_lr:
+        t_start -= ctx_lr[0]
+        t_end += ctx_lr[1]
       if recurrent_net:
         length = t_end - t_start
         if max_seq_length < 0 and length['classes'] > -max_seq_length:
@@ -523,7 +626,7 @@ class Dataset(object):
         elif max_seq_length > 0 and length.max_value() > max_seq_length:
           continue
         if length.max_value() > batch_size:
-          print >> log.v4, "warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size)
+          print("warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size), file=log.v4)
         if self.rnd_seq_drop.random() < seq_drop:
           continue
         dt, ds = batch.try_sequence_as_slice(length)
@@ -588,36 +691,6 @@ class Dataset(object):
       shuffle_batches=shuffle_batches,
       cache_whole_epoch=self.batch_set_generator_cache_whole_epoch())
 
-  def shapes_for_batches(self, batches, data_keys, batch_dim_first=False):
-    """
-    :type batches: list[EngineBatch.Batch]
-    :rtype: dict[str,list[int]] | None
-    """
-    all_data_keys = set(data_keys) | {"data"}
-
-    # The final device.data.shape is in format (time,batch,feature).
-    shape = [NumbersDict(0), 0]  # time,batch
-    for batch in batches:
-      shape = [NumbersDict.max([shape[0], batch.max_num_frames_per_slice]), shape[1] + batch.num_slices]
-    if shape[1] == 0:
-      return None
-    assert shape[0].max_value() > 0
-    # Theano has some buggy behaviour with tensors with some shape of zero.
-    # We will just use one dummy frame in that case.
-    # The index will stay zero in that case. (see EngineUtil.assign_dev_data())
-    # However, also see the OutputLayer.output_index() behavior for forwarding.
-    for k in all_data_keys:
-      shape[0][k] = max(shape[0][k], 1)
-
-    d = {k: [shape[0][k], shape[1]] for k in all_data_keys}
-    for k in d:
-      d[k] += self.get_data_shape(k)
-
-    if batch_dim_first:
-      # Just flip the first two dimensions.
-      d = {k: [shape[1], shape[0]] + shape[2:] for (k, shape) in d.items()}
-    return d
-
   @classmethod
   def index_shape_for_batches(cls, batches, data_key="data"):
     shape = [0, 0]  # time,batch
@@ -675,7 +748,7 @@ def get_dataset_class(name):
   from importlib import import_module
   # Only those modules which make sense to be loaded by the user,
   # because this function is only used for such cases.
-  mod_names = ["HDFDataset", "ExternSprintDataset", "GeneratingDataset", "NumpyDumpDataset", "MetaDataset", "LmDataset", "StereoDataset"]
+  mod_names = ["HDFDataset", "SprintDataset", "GeneratingDataset", "NumpyDumpDataset", "MetaDataset", "LmDataset", "StereoDataset", "RawWavDataset"]
   for mod_name in mod_names:
     mod = import_module(mod_name)
     if name in vars(mod):
@@ -687,10 +760,18 @@ def get_dataset_class(name):
 
 def init_dataset(kwargs):
   """
-  :type kwargs: dict[str] | str
+  :param dict[str]|str|(()->dict[str]) kwargs:
   :rtype: Dataset
   """
+  assert kwargs
+  if callable(kwargs):
+    return init_dataset(kwargs())
   if isinstance(kwargs, (str, unicode)):
+    if kwargs.startswith("config:"):
+      from Config import get_global_config
+      config = get_global_config()
+      assert config
+      return init_dataset(config.opt_typed_value(kwargs[len("config:"):]))
     return init_dataset_via_str(config_str=kwargs)
   kwargs = kwargs.copy()
   assert "class" in kwargs
@@ -700,8 +781,12 @@ def init_dataset(kwargs):
     raise Exception("Dataset class %r not found" % clazz_name)
   files = kwargs.pop("files", [])
   obj = clazz(**kwargs)
-  for f in files:
-    obj.add_file(f)
+  assert isinstance(obj, Dataset)
+  if files:
+    from HDFDataset import HDFDataset, NextGenHDFDataset
+    assert isinstance(obj, (HDFDataset, NextGenHDFDataset))
+    for f in files:
+      obj.add_file(f)
   obj.initialize()
   return obj
 
@@ -714,8 +799,8 @@ def init_dataset_via_str(config_str, config=None, cache_byte_size=None, **kwargs
   :rtype: Dataset
   """
   kwargs = kwargs.copy()
-  if not 'window' in kwargs and config and config.has('window'):
-    kwargs['window'] = config.int('window',1)
+  if 'window' not in kwargs and config and config.has('window'):
+    kwargs['window'] = config.int('window', 1)
   from HDFDataset import HDFDataset
   if config_str.startswith("sprint:"):
     kwargs["sprintConfigStr"] = config_str[len("sprint:"):]
@@ -723,7 +808,7 @@ def init_dataset_via_str(config_str, config=None, cache_byte_size=None, **kwargs
     sprintTrainerExecPath = config.value("sprint_trainer_exec_path", None)
     assert sprintTrainerExecPath, "specify sprint_trainer_exec_path in config"
     kwargs["sprintTrainerExecPath"] = sprintTrainerExecPath
-    from ExternSprintDataset import ExternSprintDataset
+    from SprintDataset import ExternSprintDataset
     cls = ExternSprintDataset
   elif ":" in config_str:
     kwargs.update(eval("dict(%s)" % config_str[config_str.find(":") + 1:]))
@@ -772,3 +857,45 @@ def convert_data_dims(data_dims, leave_dict_as_is=False):
     assert isinstance(v[1], int)
     assert 1 <= v[1] <= 2
   return data_dims
+
+
+def shapes_for_batches(batches, data_keys, dataset=None, extern_data=None):
+  """
+  :param list[EngineBatch.Batch] batches:
+  :param list[str] data_keys:
+  :param Dataset dataset:
+  :param TFNetwork.ExternData extern_data: detailed data description. only used for TensorFlow
+  :rtype: dict[str,list[int]] | None
+  """
+  assert dataset or extern_data
+  all_data_keys = set(data_keys) | {"data"}
+
+  # The final device.data.shape is in format (time,batch,feature) in case of Theano.
+  shape = [NumbersDict(0), 0]  # time,batch
+  for batch in batches:
+    shape = [NumbersDict.max([shape[0], batch.max_num_frames_per_slice]), shape[1] + batch.num_slices]
+  if shape[1] == 0:
+    return None
+  assert shape[0].max_value() > 0
+  # Theano has some buggy behaviour with tensors with some shape of zero.
+  # We will just use one dummy frame in that case.
+  # The index will stay zero in that case. (see EngineUtil.assign_dev_data())
+  # However, also see the OutputLayer.output_index() behavior for forwarding.
+  if not extern_data:  # not needed if TensorFlow is used
+    for k in all_data_keys:
+      shape[0][k] = max(shape[0][k], 1)
+
+  if extern_data:
+    d = {}
+    for k in all_data_keys:
+      data_shape = list(extern_data.data[k].batch_shape)
+      data_shape[extern_data.data[k].batch_dim_axis] = shape[1]
+      if extern_data.data[k].have_time_axis():
+        data_shape[extern_data.data[k].time_dim_axis] = shape[0][k]
+      assert all([n is not None for n in data_shape])
+      d[k] = data_shape
+  else:  # shape via dataset
+    d = {k: [shape[0][k], shape[1]] for k in all_data_keys}
+    for k in all_data_keys:
+      d[k] += dataset.get_data_shape(k)
+  return d

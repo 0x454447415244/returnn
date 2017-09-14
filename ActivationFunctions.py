@@ -10,7 +10,7 @@ def relu(z):
   # https://github.com/Lasagne/Lasagne/pull/163#issuecomment-81806482
   return (z + abs(z)) / 2.0
 
-def clipped01lu(z):
+def clipped01lu(z):    
   """
   0 for x <= 0
   x for 0 <= x <= 1
@@ -71,7 +71,9 @@ def constant_zero():
 from theano.scalar.basic import UnaryScalarOp, same_out_nocomplex
 from theano.tensor.elemwise import Elemwise
 class Round3(UnaryScalarOp):
-  def c_code(self, node, name, (x, ), (z, ), sub):
+  def c_code(self, node, name, x, z, sub):
+    x, = x
+    z, = z
     return "%(z)s = round(%(x)s);" % locals()
 
   def grad(self, inputs, gout):

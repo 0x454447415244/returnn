@@ -64,29 +64,37 @@ class OneDToTwoDFixedSizeLayer(TwoDBaseLayer):
   layer_class = "1Dto2D_fixed_size"
   recurrent = True
 
-  def __init__(self, pad_x=0, pad_y=0, **kwargs):
+  def __init__(self, pad_x=0, pad_y=0, d_row=-1, **kwargs):
     super(OneDToTwoDFixedSizeLayer, self).__init__(1, **kwargs)
     assert len(self.sources) == 1
     X = self.sources[0].output
     assert X.ndim == 3
     assert X.dtype == "float32"
 
-    if pad_x + pad_y > 0:
-      tmp = T.zeros((X.shape[0] + 2 * pad_x, X.shape[1]), 'int8')
-      self.index = T.set_subtensor(tmp[pad_x: pad_x + X.shape[0]], self.sources[0].index)
-      tmp = T.zeros((X.shape[0] + 2 * pad_x, X.shape[1], X.shape[2] + 2 * pad_y), 'float32')
-      X = T.set_subtensor(tmp[pad_x:pad_x + X.shape[0], :, pad_y:pad_y + X.shape[2]], X)
+    if d_row > 0:
+      X = X.reshape((X.shape[0],X.shape[1],d_row,X.shape[2] / d_row))
+      Y = T.unbroadcast(X.dimshuffle(2, 0, 1, 3), 3)
+      n_out = self.sources[0].attrs['n_out'] / d_row
+    else:
+     Y = X.dimshuffle(2, 0, 1, 'x')
+     n_out = 1
 
-    height = X.shape[2]
+    if pad_x + pad_y > 0:
+      tmp = T.zeros((Y.shape[1] + 2 * pad_x, Y.shape[2]), 'int8')
+      self.index = T.set_subtensor(tmp[pad_x: pad_x + Y.shape[1]], self.sources[0].index)
+      tmp = T.zeros((Y.shape[0] + 2 * pad_y, Y.shape[1] + 2 * pad_x, Y.shape[2], Y.shape[3]), 'float32')
+      Y = T.set_subtensor(tmp[pad_y:pad_y + Y.shape[0],pad_x:pad_x + Y.shape[1]], Y)
+
+    Y = T.unbroadcast(Y, 3)
+
+    height = Y.shape[0] # if n_out <= 0 else n_out
     width = T.maximum(T.sum(self.index, axis=0), T.ones_like(self.index[0]))
-    batch = X.shape[1]
+    batch = Y.shape[2]
     sizes = T.zeros((batch, 2), dtype="float32")
     sizes = T.set_subtensor(sizes[:, 0], height)
     sizes = T.set_subtensor(sizes[:, 1], width)
-    Y = T.unbroadcast(X.dimshuffle(2, 0, 1, 'x'), 3)
     self.output = Y
     self.output_sizes = sizes
-    n_out = 1
     self.set_attr('n_out', n_out)
 
 class TwoDToOneDLayer(TwoDBaseLayer):
@@ -339,49 +347,18 @@ class TwoDLSTMLayer(TwoDBaseLayer):
     b = self.add_param(b)
     return b
 
-
-printed_cudnn_warning = False
-
-
 def conv_crop_pool_op(X, sizes, output_sizes, W, b, n_in, n_maps, filter_height, filter_width, filter_dilation, poolsize):
-  global printed_cudnn_warning
-  if theano.sandbox.cuda.dnn.dnn_available():
+  from Device import is_using_gpu
+  if is_using_gpu():
     conv_op = CuDNNConvHWBCOpValidInstance
     pool_op = PoolHWBCOp(poolsize)
     conv_out = conv_op(X, W, b) if filter_height * filter_width > 0 else X
     crop_out = CropToBatchImageSizeInstance(conv_out, sizes)
     Y = pool_op(crop_out)
     Y = CropToBatchImageSizeZeroInstance(Y, output_sizes)
-    return Y
   else:
-    if not printed_cudnn_warning:
-      print >> log.v2, "warning, cudnn not available, using theano conv implementation"
-      printed_cudnn_warning = True
-    #note: this solution uses alot of dimshuffles and so also alot of memory
-    #I only have this so that I can still run on my laptop for testing
-    #it's not really useful for productive use and also not much tested
-    filter_shape = (n_maps, n_in, filter_height, filter_width)
-    X_shuffled = X.dimshuffle(2, 3, 0, 1)
-    conv_out = conv.conv2d(input=X_shuffled, border_mode="valid", filters=W,
-                           filter_shape=filter_shape, # filter_dilation=filter_dilation,
-                           image_shape=(None, n_in, None, None)) if filter_height * filter_width > 0 else X
-    crop_out = CropToBatchImageSizeInstance(conv_out.dimshuffle(2, 3, 0, 1), sizes).dimshuffle(2, 3, 0, 1)
-    if poolsize == (1, 1):
-      Y = crop_out
-    else:
-      #pooling cannot handle width > 512 (only with cuDNN), so we swap the axes and swap them back afterwards
-      crop_out = crop_out.dimshuffle(0, 1, 3, 2)
-      pooled_out = pool.pool_2d(
-        input=crop_out,
-        #max_pool_2d wants the sizes in the other order
-        ds=poolsize[::-1],
-        ignore_border=True
-      )
-      #unshuffle it
-      Y = pooled_out.dimshuffle(0, 1, 3, 2)
-    Y = Y.dimshuffle(2, 3, 0, 1)
-    Y += b
-    return Y
+    Y = X
+  return Y
 
 
 class ConvBaseLayer(TwoDBaseLayer):

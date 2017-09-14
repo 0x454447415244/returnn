@@ -1,4 +1,9 @@
 
+from __future__ import print_function
+
+import sys
+sys.path += ["."]  # Python 3 hack
+
 from nose.tools import assert_equal, assert_is_instance, assert_in, assert_not_in, assert_true, assert_false
 import SprintInterface as SprintAPI
 import os
@@ -7,6 +12,7 @@ from tempfile import mkdtemp
 from Engine import Engine
 from Config import Config
 from Log import log
+from Network import LayerNetwork
 import shutil
 import numpy
 import better_exchook
@@ -20,21 +26,21 @@ def install_sigint_handler():
   import Util
 
   def signal_handler(signal, frame):
-    print "\nSIGINT at:"
+    print("\nSIGINT at:")
     better_exchook.print_tb(tb=frame, file=sys.stdout)
-    print ""
+    print("")
 
     # It's likely that SIGINT was caused by Util.interrupt_main().
     # We might have a stacktrace from there.
     if getattr(sys, "exited_frame", None) is not None:
-      print "interrupt_main via:"
+      print("interrupt_main via:")
       better_exchook.print_tb(tb=sys.exited_frame, file=sys.stdout)
-      print ""
+      print("")
       sys.exited_frame = None
       # Normal exception instead so that Nose will catch it.
       raise Exception("Got SIGINT!")
     else:
-      print "\nno sys.exited_frame\n"
+      print("\nno sys.exited_frame\n")
       # Normal SIGINT. Normal Nose exit.
       if old_action:
         old_action()
@@ -53,6 +59,7 @@ def create_first_epoch(config_filename):
   engine.init_train_from_config(config=config, train_data=None)
   engine.epoch = 1
   engine.save_model(engine.get_epoch_model_filename(), epoch=engine.epoch)
+  Engine._epoch_model = None
 
 
 
@@ -81,6 +88,10 @@ def test_forward():
   SprintAPI.init(inputDim=inputDim, outputDim=outputDim,
                  config="action:forward,configfile:config,epoch:1",
                  targetMode="forward-only")
+  assert isinstance(SprintAPI.engine, Engine)
+  assert isinstance(SprintAPI.engine.network, LayerNetwork)
+  print("used data keys via net:", SprintAPI.engine.network.get_used_data_keys())
+  print("used data keys via dev:", SprintAPI.engine.devices[0].used_data_keys)
 
   features = numpy.array([[0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5]])
   seq_len = features.shape[0]

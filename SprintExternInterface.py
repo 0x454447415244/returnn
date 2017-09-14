@@ -5,10 +5,14 @@ See SprintInterface.py for another Sprint interface.
 This Sprint interface is to be used for ExternSprintDataset, which should automatically use it.
 """
 
+from __future__ import print_function
+
+import better_exchook
+import sys
 import os
 import TaskSystem
 from TaskSystem import Pickler, Unpickler
-from Util import to_bool
+from Util import to_bool, unicode
 
 # Start Sprint PythonSegmentOrder interface. {
 # We use the PythonSegmentOrder just to get an estimate (upper limit) about the number of sequences.
@@ -45,9 +49,14 @@ def getSegmentList(corpusName, segmentList, **kwargs):
 
 isInitialized = False
 
+def exchook(exc_type, exc_obj, exc_tb):
+  if exc_type is KeyboardInterrupt:
+    print("SprintExternInterface[pid %i]: KeyboardInterrupt" % (os.getpid(),))
+    sys.exit(1)
+  better_exchook.better_exchook(exc_type, exc_obj, exc_tb)
+
 def init(**kwargs):
-  import better_exchook
-  better_exchook.install()
+  sys.excepthook = exchook
   # This module can also be used for Sprint PythonControl, which will also call init().
   # We need to catch these cases.
   if "name" in kwargs and kwargs["name"] == "Sprint.PythonControl":
@@ -78,11 +87,11 @@ def init_PythonTrainer(inputDim, outputDim, config, targetMode, **kwargs):
   :param str targetMode: "target-alignment" or "criterion-by-sprint" or so
   """
   print("SprintExternInterface[pid %i]: PythonTrainer init_PythonTrainer()" % (os.getpid(),))
-  print "inputDim:", inputDim
-  print "outputDim:", outputDim
-  print "config:", config
-  print "targetMode:", targetMode
-  print "other args:", kwargs
+  print("inputDim:", inputDim)
+  print("outputDim:", outputDim)
+  print("config:", config)
+  print("targetMode:", targetMode)
+  print("other args:", kwargs)
 
   global InputDim, OutputDim, isInitialized
   InputDim = inputDim
@@ -106,7 +115,7 @@ def _init_global_sprintDataset(inputDim, outputDim, config):
 
 
 def exit():
-  print "SprintExternInterface: PythonTrainer exit()"
+  print("SprintExternInterface: PythonTrainer exit()")
   assert isInitialized
   sprintDataset.close()
 
@@ -198,8 +207,8 @@ class ExternSprintDatasetSource:
     :type numSegments: int | None
     :param numSegments: can be None if not known in advance
     """
-    self.pipe_c2p = os.fdopen(c2p_fd, "w")
-    self.pipe_p2c = os.fdopen(p2c_fd, "r")
+    self.pipe_c2p = os.fdopen(c2p_fd, "wb")
+    self.pipe_p2c = os.fdopen(p2c_fd, "rb")
     self._send("init", (inputDim, outputDim, numSegments))
 
   def _send(self, dataType, args=None):

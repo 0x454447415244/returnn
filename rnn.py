@@ -1,8 +1,15 @@
 #!/usr/bin/env python2.7
 
 """
+Main entry point
+================
+
 This is the main entry point. You can execute this file.
+See :func:`rnn.initConfig` for some arguments, or just run ``./rnn.py --help``.
+See :ref:`tech_overview` for a technical overview.
 """
+
+from __future__ import print_function
 
 __author__ = "Patrick Doetsch"
 __copyright__ = "Copyright 2014"
@@ -12,102 +19,101 @@ __maintainer__ = "Patrick Doetsch"
 __email__ = "doetsch@i6.informatik.rwth-aachen.de"
 
 
-import re
 import os
 import sys
 import time
-import json
 import numpy
-from optparse import OptionParser
 from Log import log
-from Device import Device, get_num_devices, TheanoFlags, getDevicesInitArgs
+from Device import Device, TheanoFlags, getDevicesInitArgs
 from Config import Config
 from Engine import Engine
-from Dataset import Dataset, init_dataset, init_dataset_via_str, get_dataset_class
+from Dataset import Dataset, init_dataset, init_dataset_via_str
 from HDFDataset import HDFDataset
 from Debug import initIPythonKernel, initBetterExchook, initFaulthandler, initCudaNotInMainProcCheck
-from Util import initThreadJoinHack, custom_exec, describe_crnn_version, describe_theano_version, \
-  describe_tensorflow_version, BackendEngine
+from Util import initThreadJoinHack, describe_crnn_version, describe_theano_version, \
+  describe_tensorflow_version, BackendEngine, get_tensorflow_version_tuple
+try:
+  import Server
+except ImportError:
+  Server = None
 
 
 config = None; """ :type: Config """
-engine = None; """ :type: Engine | TFEngine.Engine """
+engine = None; """ :type: TFEngine.Engine | Engine """
 train_data = None; """ :type: Dataset """
 dev_data = None; """ :type: Dataset """
 eval_data = None; """ :type: Dataset """
 quit = False
+server = None; """:type: Server"""
 
 
-def initConfig(configFilename=None, commandLineOptions=()):
+def initConfig(configFilename=None, commandLineOptions=(), extra_updates=None):
   """
-  :type configFilename: str
-  :type commandLineOptions: list[str]
+  :param str|None configFilename:
+  :param list[str]|tuple[str] commandLineOptions: e.g. ``sys.argv[1:]``
+  :param dict[str]|None extra_updates:
+
   Initializes the global config.
+  There are multiple sources which are used to init the config:
+
+    * ``configFilename``, and maybe first item of ``commandLineOptions`` interpret as config filename
+    * other options via ``commandLineOptions``
+    * ``extra_updates``
+
+  Note about the order/priority of these:
+
+    * ``extra_updates``
+    * options from ``commandLineOptions``
+    * ``configFilename``
+    * config filename from ``commandLineOptions[0]``
+    * ``extra_updates``
+    * options from ``commandLineOptions``
+
+  ``extra_updates`` and ``commandLineOptions`` are used twice so that they are available
+  when the config is loaded, which thus has access to them, and can e.g. use them via Python code.
+  However, the purpose is that they overwrite any option from the config;
+  that is why we apply them again in the end.
+
+  ``commandLineOptions`` is applied after ``extra_updates`` so that the user has still the possibility
+  to overwrite anything set by ``extra_updates``.
   """
   global config
   config = Config()
-  if configFilename:
-    assert os.path.isfile(configFilename), "config file not found"
-    config.load_file(configFilename)
+
+  config_filename_by_cmd_line = None
   if commandLineOptions and commandLineOptions[0][:1] not in ["-", "+"]:
     # Assume that this is a config filename.
-    config.load_file(commandLineOptions[0])
-    commandLineOptions = commandLineOptions[1:]
-  parser = OptionParser()
-  parser.add_option("-a", "--activation", dest = "activation", help = "[STRING/LIST] Activation functions: logistic, tanh, softsign, relu, identity, zero, one, maxout.")
-  parser.add_option("-b", "--batch_size", dest = "batch_size", help = "[INTEGER/TUPLE] Maximal number of frames per batch (optional: shift of batching window).")
-  parser.add_option("-c", "--chunking", dest = "chunking", help = "[INTEGER/TUPLE] Maximal number of frames per sequence (optional: shift of chunking window).")
-  parser.add_option("-d", "--description", dest = "description", help = "[STRING] Description of experiment.")
-  parser.add_option("-e", "--epoch", dest = "epoch", help = "[INTEGER] Starting epoch.")
-  parser.add_option("-E", "--eval", dest = "eval", help = "[STRING] eval file path")
-  parser.add_option("-f", "--gate_factors", dest = "gate_factors", help = "[none/local/global] Enables pooled (local) or separate (global) coefficients on gates.")
-  parser.add_option("-g", "--lreg", dest = "lreg", help = "[FLOAT] L1 or L2 regularization.")
-  parser.add_option("-i", "--save_interval", dest = "save_interval", help = "[INTEGER] Number of epochs until a new model will be saved.")
-  parser.add_option("-j", "--dropout", dest = "dropout", help = "[FLOAT] Dropout probability (0 to disable).")
-  #parser.add_option("-k", "--multiprocessing", dest = "multiprocessing", help = "[BOOLEAN] Enable multi threaded processing (required when using multiple devices).")
-  parser.add_option("-k", "--output_file", dest = "output_file", help = "[STRING] Path to target file for network output.")
-  parser.add_option("-l", "--log", dest = "log", help = "[STRING] Log file path.")
-  parser.add_option("-L", "--load", dest = "load", help = "[STRING] load model file path.")
-  parser.add_option("-m", "--momentum", dest = "momentum", help = "[FLOAT] Momentum term in gradient descent optimization.")
-  parser.add_option("-n", "--num_epochs", dest = "num_epochs", help = "[INTEGER] Number of epochs that should be trained.")
-  parser.add_option("-o", "--order", dest = "order", help = "[default/sorted/random] Ordering of sequences.")
-  parser.add_option("-p", "--loss", dest = "loss", help = "[loglik/sse/ctc] Objective function to be optimized.")
-  parser.add_option("-q", "--cache", dest = "cache", help = "[INTEGER] Cache size in bytes (supports notation for kilo (K), mega (M) and gigabtye (G)).")
-  parser.add_option("-r", "--learning_rate", dest = "learning_rate", help = "[FLOAT] Learning rate in gradient descent optimization.")
-  parser.add_option("-s", "--hidden_sizes", dest = "hidden_sizes", help = "[INTEGER/LIST] Number of units in hidden layers.")
-  parser.add_option("-t", "--truncate", dest = "truncate", help = "[INTEGER] Truncates sequence in BPTT routine after specified number of timesteps (-1 to disable).")
-  parser.add_option("-u", "--device", dest = "device", help = "[STRING/LIST] CPU and GPU devices that should be used (example: gpu0,cpu[1-6] or gpu,cpu*).")
-  parser.add_option("-v", "--verbose", dest = "log_verbosity", help = "[INTEGER] Verbosity level from 0 - 5.")
-  parser.add_option("-w", "--window", dest = "window", help = "[INTEGER] Width of sliding window over sequence.")
-  parser.add_option("-x", "--task", dest = "task", help = "[train/forward/analyze] Task of the current program call.")
-  parser.add_option("-y", "--hidden_type", dest = "hidden_type", help = "[VALUE/LIST] Hidden layer types: forward, recurrent, lstm.")
-  parser.add_option("-z", "--max_sequences", dest = "max_seqs", help = "[INTEGER] Maximal number of sequences per batch.")
-  parser.add_option("--config", dest="load_config", help="[STRING] load config")
-  (options, args) = parser.parse_args(commandLineOptions)
-  options = vars(options)
-  for opt in options.keys():
-    if options[opt] is not None:
-      if opt == "load_config":
-        config.load_file(options[opt])
-      else:
-        config.add_line(opt, options[opt])
-  assert len(args) % 2 == 0, "expect (++key, value) config tuples in remaining args: %r" % args
-  for i in range(0, len(args), 2):
-    key, value = args[i:i+2]
-    assert key[0:2] == "++", "expect key prefixed with '++' in (%r, %r)" % (key, value)
-    if value[:2] == "+-": value = value[1:]  # otherwise we never could specify things like "++threshold -0.1"
-    config.add_line(key=key[2:], value=value)
+    config_filename_by_cmd_line, commandLineOptions = commandLineOptions[0], commandLineOptions[1:]
+
+  if extra_updates:
+    config.update(extra_updates)
+  if commandLineOptions:
+    config.parse_cmd_args(commandLineOptions)
+  if configFilename:
+    config.load_file(configFilename)
+  if config_filename_by_cmd_line:
+    config.load_file(config_filename_by_cmd_line)
+  if extra_updates:
+    config.update(extra_updates)
+  if commandLineOptions:
+    config.parse_cmd_args(commandLineOptions)
+
   # I really don't know where to put this otherwise:
   if config.bool("EnableAutoNumpySharedMemPickling", False):
     import TaskSystem
     TaskSystem.SharedMemNumpyConfig["enabled"] = True
+  # Server default options
+  if config.value('task', 'train') == 'server':
+    config.set('num_inputs', 2)
+    config.set('num_outputs', 1)
+    #config.set('network', [{'out': {'loss': 'ce', 'class': 'softmax', 'target': 'classes'}}])
 
 
 def initLog():
   logs = config.list('log', [])
   log_verbosity = config.int_list('log_verbosity', [])
   log_format = config.list('log_format', [])
-  log.initialize(logs = logs, verbosity = log_verbosity, formatter = log_format)
+  log.initialize(logs=logs, verbosity=log_verbosity, formatter=log_format)
 
 
 def initConfigJsonNetwork():
@@ -115,7 +121,7 @@ def initConfigJsonNetwork():
   if config.has('initialize_from_json'):
     json_file = config.value('initialize_from_json', '')
     assert os.path.isfile(json_file), "json file not found: " + json_file
-    print >> log.v5, "loading network topology from json:", json_file
+    print("loading network topology from json:", json_file, file=log.v5)
     config.network_topology_json = open(json_file).read().encode('utf8')
 
 
@@ -127,15 +133,17 @@ def initDevices():
   if BackendEngine.is_tensorflow_selected():
     if os.environ.get("TF_DEVICE"):
       config.set("device", os.environ.get("TF_DEVICE"))
-      print >> log.v4, "Devices: Use %s via TF_DEVICE instead of %s." % \
-                       (os.environ.get("TF_DEVICE"), oldDeviceConfig)
+      print("Devices: Use %s via TF_DEVICE instead of %s." %
+            (os.environ.get("TF_DEVICE"), oldDeviceConfig), file=log.v4)
   if not BackendEngine.is_theano_selected():
     return None
+  if config.value("task", "train") == "nop":
+    return []
   if "device" in TheanoFlags:
     # This is important because Theano likely already has initialized that device.
     config.set("device", TheanoFlags["device"])
-    print >> log.v4, "Devices: Use %s via THEANO_FLAGS instead of %s." % \
-                     (TheanoFlags["device"], oldDeviceConfig)
+    print("Devices: Use %s via THEANO_FLAGS instead of %s." % \
+                     (TheanoFlags["device"], oldDeviceConfig), file=log.v4)
   devArgs = getDevicesInitArgs(config)
   assert len(devArgs) > 0
   devices = [Device(**kwargs) for kwargs in devArgs]
@@ -143,9 +151,9 @@ def initDevices():
     while not device.initialized:
       time.sleep(0.25)
   if devices[0].blocking:
-    print >> log.v4, "Devices: Used in blocking / single proc mode."
+    print("Devices: Used in blocking / single proc mode.", file=log.v4)
   else:
-    print >> log.v4, "Devices: Used in multiprocessing mode."
+    print("Devices: Used in multiprocessing mode.", file=log.v4)
   return devices
 
 
@@ -184,7 +192,7 @@ def load_data(config, cache_byte_size, files_config_key, **kwargs):
   :param Config config:
   :param int cache_byte_size:
   :param str files_config_key: such as "train" or "dev"
-  :param dict[str] kwargs: passed on to init_dataset() or init_dataset_via_str()
+  :param kwargs: passed on to init_dataset() or init_dataset_via_str()
   :rtype: (Dataset,int)
   :returns the dataset, and the cache byte size left over if we cache the whole dataset.
   """
@@ -221,10 +229,10 @@ def initData():
   elif config.value('chunking', "0") == "1": # MLP mode
     chunking = "1"
   global train_data, dev_data, eval_data
-  dev_data, extra_cache_bytes_dev = load_data(config, cache_byte_sizes[1], 'dev', chunking=chunking,
-                                         seq_ordering="sorted", shuffle_frames_of_nseqs=0)
-  eval_data, extra_cache_bytes_eval = load_data(config, cache_byte_sizes[2], 'eval', chunking=chunking,
-                                           seq_ordering="sorted", shuffle_frames_of_nseqs=0)
+  dev_data, extra_cache_bytes_dev = load_data(
+    config, cache_byte_sizes[1], 'dev', chunking=chunking, seq_ordering="sorted", shuffle_frames_of_nseqs=0)
+  eval_data, extra_cache_bytes_eval = load_data(
+    config, cache_byte_sizes[2], 'eval', chunking=chunking, seq_ordering="sorted", shuffle_frames_of_nseqs=0)
   train_cache_bytes = cache_byte_sizes[0]
   if train_cache_bytes >= 0:
     # Maybe we have left over cache from dev/eval if dev/eval have cached everything.
@@ -238,26 +246,26 @@ def printTaskProperties(devices=None):
   """
 
   if train_data:
-    print >> log.v2, "Train data:"
-    print >> log.v2, "  input:", train_data.num_inputs, "x", train_data.window
-    print >> log.v2, "  output:", train_data.num_outputs
-    print >> log.v2, " ", train_data.len_info() or "no info"
+    print("Train data:", file=log.v2)
+    print("  input:", train_data.num_inputs, "x", train_data.window, file=log.v2)
+    print("  output:", train_data.num_outputs, file=log.v2)
+    print(" ", train_data.len_info() or "no info", file=log.v2)
   if dev_data:
-    print >> log.v2, "Dev data:"
-    print >> log.v2, " ", dev_data.len_info() or "no info"
+    print("Dev data:", file=log.v2)
+    print(" ", dev_data.len_info() or "no info", file=log.v2)
   if eval_data:
-    print >> log.v2, "Eval data:"
-    print >> log.v2, " ", eval_data.len_info() or "no info"
+    print("Eval data:", file=log.v2)
+    print(" ", eval_data.len_info() or "no info", file=log.v2)
 
   if devices:
-    print >> log.v3, "Devices:"
+    print("Devices:", file=log.v3)
     for device in devices:
-      print >> log.v3, "  %s: %s" % (device.name, device.device_name),
-      print >> log.v3, "(units:", device.get_device_shaders(), \
-                       "clock: %.02fGhz" % (device.get_device_clock() / 1024.0), \
-                       "memory: %.01f" % (device.get_device_memory() / float(1024 * 1024 * 1024)) + "GB)",
-      print >> log.v3, "working on", device.num_batches, "batches" if device.num_batches > 1 else "batch",
-      print >> log.v3, "(update on device)" if device.update_specs['update_rule'] != 'none' else "(update on host)"
+      print("  %s: %s" % (device.name, device.device_name), end=' ', file=log.v3)
+      print("(units:", device.get_device_shaders(),
+            "clock: %.02fGhz" % (device.get_device_clock() / 1024.0),
+            "memory: %.01f" % (device.get_device_memory() / float(1024 * 1024 * 1024)) + "GB)", end=' ', file=log.v3)
+      print("working on", device.num_batches, "batches" if device.num_batches > 1 else "batch", end=' ', file=log.v3)
+      print("(update on device)" if device.update_specs['update_rule'] != 'none' else "(update on host)", file=log.v3)
 
 
 def initEngine(devices):
@@ -275,30 +283,46 @@ def initEngine(devices):
     raise NotImplementedError
 
 
-def crnnGreeting():
-  print >> log.v3, "CRNN starting up, version %s, pid %i" % (describe_crnn_version(), os.getpid())
+def crnnGreeting(configFilename=None, commandLineOptions=None):
+  print("CRNN starting up, version %s, pid %i, cwd %s" % (
+    describe_crnn_version(), os.getpid(), os.getcwd()), file=log.v3)
+  if configFilename:
+    print("CRNN config: %s" % configFilename, file=log.v4)
+    if os.path.islink(configFilename):
+      print("CRNN config is symlink to: %s" % os.readlink(configFilename), file=log.v4)
+  if commandLineOptions is not None:
+    print("CRNN command line options: %s" % (commandLineOptions,), file=log.v4)
 
 
 def initBackendEngine():
   BackendEngine.select_engine(config=config)
   if BackendEngine.is_theano_selected():
-    print >> log.v3, "Theano:", describe_theano_version()
+    print("Theano:", describe_theano_version(), file=log.v3)
   elif BackendEngine.is_tensorflow_selected():
-    print >> log.v3, "TensorFlow:", describe_tensorflow_version()
-    from Util import to_bool
-    from TFUtil import debugRegisterBetterRepr
-    if os.environ.get("DEBUG_TF_BETTER_REPR") and to_bool(os.environ.get("DEBUG_TF_BETTER_REPR")):
-      debugRegisterBetterRepr()
+    print("TensorFlow:", describe_tensorflow_version(), file=log.v3)
+    if get_tensorflow_version_tuple()[0] == 0:
+      print("Warning: TF <1.0 is not supported and likely broken.", file=log.v2)
+    from TFUtil import debugRegisterBetterRepr, setup_tf_thread_pools
+    setup_tf_thread_pools(log_file=log.v2)
+    debugRegisterBetterRepr()
   else:
     raise NotImplementedError
 
 
-def init(configFilename=None, commandLineOptions=()):
+def init(configFilename=None, commandLineOptions=(), config_updates=None, extra_greeting=None):
+  """
+  :param str|None configFilename:
+  :param tuple[str]|list[str]|None commandLineOptions:
+  :param dict[str]|None config_updates:
+  :param str|None extra_greeting:
+  """
   initBetterExchook()
   initThreadJoinHack()
-  initConfig(configFilename=configFilename, commandLineOptions=commandLineOptions)
+  initConfig(configFilename=configFilename, commandLineOptions=commandLineOptions, extra_updates=config_updates)
   initLog()
-  crnnGreeting()
+  if extra_greeting:
+    print(extra_greeting, file=log.v1)
+  crnnGreeting(configFilename=configFilename, commandLineOptions=commandLineOptions)
   initBackendEngine()
   initFaulthandler()
   if BackendEngine.is_theano_selected():
@@ -313,10 +337,14 @@ def init(configFilename=None, commandLineOptions=()):
   if needData():
     initData()
   printTaskProperties(devices)
-  initEngine(devices)
+  if config.value('task', 'train') == 'server':
+    server = Server.Server(config)
+  else:
+    initEngine(devices)
 
 
 def finalize():
+  print("Quitting", file=getattr(log, "v4", sys.stderr))
   global quit
   quit = True
   sys.exited = True
@@ -328,15 +356,18 @@ def finalize():
     if engine:
       engine.finalize()
 
+
 def needData():
+  if config.has("need_data") and not config.bool("need_data", True):
+    return False
   task = config.value('task', 'train')
-  if task == 'theano_graph':
+  if task in ['theano_graph', "nop"]:
     return False
   return True
 
 
 def executeMainTask():
-  st = time.time()
+  start_time = time.time()
   task = config.value('task', 'train')
   if task == 'train':
     assert train_data.have_seqs(), "no train files specified, check train option: %s" % config.value('train', None)
@@ -346,7 +377,7 @@ def executeMainTask():
     engine.init_train_from_config(config, train_data, dev_data, eval_data)
     engine.epoch = config.int("epoch", None)
     assert engine.epoch
-    print >> log.v4, "Evaluate epoch", engine.epoch
+    print("Evaluate epoch", engine.epoch, file=log.v4)
     engine.eval_model()
   elif task == 'forward':
     assert eval_data is not None, 'no eval data provided'
@@ -357,6 +388,18 @@ def executeMainTask():
     engine.forward_to_hdf(
       data=eval_data, output_file=output_file, combine_labels=combine_labels,
       batch_size=config.int('forward_batch_size', 0))
+  elif task == "search":
+    engine.use_search_flag = True
+    engine.init_network_from_config(config)
+    if config.value("search_data", "eval") in ["train", "dev", "eval"]:
+      data = {"train": train_data, "dev": dev_data, "eval": eval_data}[config.value("search_data", "eval")]
+      assert data, "set search_data"
+    else:
+      data = init_dataset(config.opt_typed_value("search_data"))
+    engine.search(
+      data,
+      output_layer_name=config.value("search_output_layer", "output"),
+      output_file=config.value("search_output_file", ""))
   elif task == 'compute_priors':
     assert train_data is not None, 'train data for priors should be provided'
     engine.init_network_from_config(config)
@@ -370,7 +413,7 @@ def executeMainTask():
     for task in config.list('theano_graph.task', ['train']):
       func = engine.devices[-1].get_compute_func(task)
       prefix = config.value("theano_graph.prefix", "current") + ".task"
-      print >>log.v1, "dumping to %s.* ..." % prefix
+      print("dumping to %s.* ..." % prefix, file=log.v1)
       theano.printing.debugprint(func, file=open("%s.optimized_func.txt" % prefix, "w"))
       assert isinstance(func.maker, theano.compile.function_module.FunctionMaker)
       for inp in func.maker.inputs:
@@ -380,9 +423,9 @@ def executeMainTask():
       theano.printing.pydotprint(func, format='png', var_with_name_simple=True,
                                  outfile = "%s.png" % prefix)
   elif task == 'analyze':  # anything based on the network + Device
-    statistics = config.list('statistics', ['confusion_matrix'])
+    statistics = config.list('statistics', None)
     engine.init_network_from_config(config)
-    engine.analyze(engine.devices[0], eval_data, statistics)
+    engine.analyze(data=eval_data or dev_data, statistics=statistics)
   elif task == "analyze_data":  # anything just based on the data
     analyze_data(config)
   elif task == "classify":
@@ -393,18 +436,38 @@ def executeMainTask():
     engine.classify(engine.devices[0], eval_data, label_file)
   elif task == "daemon":
     engine.init_network_from_config(config)
-    engine.daemon()
+    engine.daemon(config)
+  elif task == "server":
+    print("Server Initiating", file=log.v1)
+  elif task.startswith("config:"):
+    action = config.typed_dict[task[len("config:"):]]
+    print("Task: %r" % action, file=log.v1)
+    assert callable(action)
+    action()
+  elif task.startswith("optional-config:"):
+    action = config.typed_dict.get(task[len("optional-config:"):], None)
+    if action is None:
+      print("No task found for %r, so just quitting." % task, file=log.v1)
+    else:
+      print("Task: %r" % action, file=log.v1)
+      assert callable(action)
+      action()
+  elif task == "nop":
+    print("Task: No-operation", file=log.v1)
   else:
     assert False, "unknown task: %s" % task
 
-  print >> log.v3, ("elapsed: %f" % (time.time() - st))
+  print(("elapsed: %f" % (time.time() - start_time)), file=log.v3)
 
 
 def analyze_data(config):
+  """
+  :param Config config:
+  """
   dss = config.value('analyze_dataset', 'train')
   ds = {"train": train_data, "dev": dev_data, "eval": eval_data}[dss]
   epoch = config.int('epoch', 1)
-  print >> log.v1, "Analyze dataset", dss, "epoch", epoch
+  print("Analyze dataset", dss, "epoch", epoch, file=log.v1)
   ds.init_seq_order(epoch=epoch)
   stat_prefix = config.value('statistics_save_prefix', 'statistics')
   dtype = config.value('statistics_dtype', 'float64')
@@ -437,17 +500,17 @@ def analyze_data(config):
   log_priors = numpy.log(priors)
   log_priors -= numpy.log(NumbersDict(ds.get_num_timesteps())[target])
   var = numpy.sqrt(mean_sq - mean * mean)
-  print >> log.v1, "Finished. %i total target frames, %i total data frames" % (total_targets_len, total_data_len)
+  print("Finished. %i total target frames, %i total data frames" % (total_targets_len, total_data_len), file=log.v1)
   priors_fn = stat_prefix + ".log_priors.txt"
   mean_fn = stat_prefix + ".mean.txt"
   var_fn = stat_prefix + ".var.txt"
-  print >> log.v1, "Dump priors to", priors_fn
+  print("Dump priors to", priors_fn, file=log.v1)
   numpy.savetxt(priors_fn, log_priors)
-  print >> log.v1, "Dump mean to", mean_fn
+  print("Dump mean to", mean_fn, file=log.v1)
   numpy.savetxt(mean_fn, mean)
-  print >> log.v1, "Dump var to", var_fn
+  print("Dump var to", var_fn, file=log.v1)
   numpy.savetxt(var_fn, var)
-  print >> log.v1, "Done."
+  print("Done.", file=log.v1)
 
 
 def main(argv):
@@ -458,7 +521,9 @@ def main(argv):
     executeMainTask()
   except KeyboardInterrupt:
     return_code = 1
-    print >> getattr(log, "v3", sys.stderr), "KeyboardInterrupt"
+    print("KeyboardInterrupt", file=getattr(log, "v3", sys.stderr))
+    if getattr(log, "verbose", [False] * 6)[5]:
+      sys.excepthook(*sys.exc_info())
   finalize()
   if return_code:
     sys.exit(return_code)

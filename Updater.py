@@ -1,4 +1,6 @@
 
+from __future__ import print_function
+
 import theano
 import numpy
 import os
@@ -65,10 +67,10 @@ class Updater:
                adamdelta=False,
                adam_fit_learning_rate=True,
                adamax=False,
-               adamvr=False,
                nadam=False,
                nadam_decay=0.004,  # Magical 250.0 denominator in nesterov scaling of i_t
                eve=False,
+               gradient_l2_norm=False,
                mean_normalized_sgd=False,
                mean_normalized_sgd_average_interpolation=0.5,
                rmsprop=0.0,
@@ -77,6 +79,7 @@ class Updater:
                update_multiple_models_average_step_i=0, update_multiple_models_averaging=True,
                update_multiple_models_param_is_cur_model=False,
                multi_batch_update=0,
+               variance_reduction=False,
                enforce_triangular_matrix_zero=False,
                gradient_noise=0.0,
                gradient_noise_decay=0.55,
@@ -136,13 +139,13 @@ class Updater:
     self.adadelta_decay = numpy.float32(adadelta_decay)
     self.adadelta_offset = numpy.float32(adadelta_offset)
     self.adasecant = adasecant
-    self.adamvr = adamvr
     self.nadam = nadam
     self.nadam_decay = nadam_decay
     self.adam = adam
     self.eve = eve
     self.adamdelta = adamdelta
     self.adam_fit_learning_rate = adam_fit_learning_rate
+    self.variance_reduction = variance_reduction
     self.adamax = adamax
     self.mean_normalized_sgd = mean_normalized_sgd
     self.mean_normalized_sgd_average_interpolation = numpy.float32(mean_normalized_sgd_average_interpolation)
@@ -159,38 +162,39 @@ class Updater:
     self.gradient_noise_decay = gradient_noise_decay
     self.grad_noise_rel_grad_norm = grad_noise_rel_grad_norm
     self.reset_update_params = reset_update_params
+    self.gradient_l2_norm = gradient_l2_norm
     self.device = str(theano.config.device)
     self.params = {}
     self.pid = -1
-    if self.adadelta or self.adamdelta:
+    if self.adadelta:
       self.momentum = 0.0
       self.nesterov_momentum = 0.0
       self.momentum2 = 0.0
-      print >> log.v4, "using adadelta with decay", self.adadelta_decay, ", offset", self.adadelta_offset
+      print("using adadelta with decay", self.adadelta_decay, ", offset", self.adadelta_offset, file=log.v4)
     if self.adagrad:
-      print >> log.v4, "using adagrad"
+      print("using adagrad", file=log.v4)
     if self.momentum:
-      print >> log.v4, "using momentum %f" % self.momentum
+      print("using momentum %f" % self.momentum, file=log.v4)
     if self.nesterov_momentum:
-      print >> log.v4, "using simplified nesterov momentum %f" % self.nesterov_momentum
+      print("using simplified nesterov momentum %f" % self.nesterov_momentum, file=log.v4)
     if self.momentum2:
-      print >> log.v4, "using reverted momentum %f" % self.momentum2
+      print("using reverted momentum %f" % self.momentum2, file=log.v4)
     if self.gradient_clip > 0:
-      print >> log.v4, "using gradient clipping %f" % self.gradient_clip
+      print("using gradient clipping %f" % self.gradient_clip, file=log.v4)
     if self.update_clip > 0:
-      print >> log.v4, "using update clipping %f" % self.update_clip
+      print("using update clipping %f" % self.update_clip, file=log.v4)
     if self.rmsprop:
-      print >> log.v4, "using RMSProp with rho = %f" % self.rmsprop
+      print("using RMSProp with rho = %f" % self.rmsprop, file=log.v4)
     if self.smorms3:
-      print >> log.v4, "using SMORMS3"
+      print("using SMORMS3", file=log.v4)
     if self.adamax:
-      print >> log.v4, "using AdaMax with b1 = 0.9 and b2 = 0.999"
+      print("using AdaMax with b1 = 0.9 and b2 = 0.999", file=log.v4)
     if self.adam:
-      print >> log.v4, "using adam"
+      print("using adam", file=log.v4)
     if self.nadam:
-      print >> log.v4, "using adam with nag and momentum schedule"
+      print("using adam with nag and momentum schedule", file=log.v4)
     if self.eve:
-      print >> log.v4, "using eve optimizer (Adam with feedback)"
+      print("using eve optimizer (Adam with feedback)", file=log.v4)
 
   def initVars(self, network, net_param_deltas):
     """
@@ -335,12 +339,12 @@ class Updater:
           if W not in self.network.train_params_vars: all_in_train = False
           if s.attrs['sparse']: sparse_input = True
         if not all_in_train:
-          print >>log.v4, "Mean-normalized SGD: layer", layer_name, "not trained"
+          print("Mean-normalized SGD: layer", layer_name, "not trained", file=log.v4)
           continue
         if sparse_input:
-          print >>log.v4, "Mean-normalized SGD: layer", layer_name, "has sparse input, not supported yet"
+          print("Mean-normalized SGD: layer", layer_name, "has sparse input, not supported yet", file=log.v4)
           continue
-        print >>log.v4, "Mean-normalized SGD: used for W_in of layer", layer_name
+        print("Mean-normalized SGD: used for W_in of layer", layer_name, file=log.v4)
         avg_f = numpy.float32(self.mean_normalized_sgd_average_interpolation)
         delta_b = grads[layer.b]
         for s, W_in in zip(layer.sources, layer.W_in):
@@ -426,6 +430,8 @@ class Updater:
       deltas = grads[param] * T.cast(gradient_scale,'float32')
       if self.max_norm > 0:
         deltas = self.norm_constraint(deltas, self.max_norm)
+      if self.gradient_l2_norm:
+        deltas = deltas / (deltas.norm(2) + numpy.float32(1e-10))
 
       if self.gradient_noise > 0.0: # http://arxiv.org/pdf/1511.06807v1.pdf
         nu = self.gradient_noise # try 0.01 0.3 1.0
@@ -454,19 +460,154 @@ class Updater:
         deltas = T.clip(deltas, -self.gradient_clip, self.gradient_clip)
       #if self.momentum > 0:
       #  upd[p] += self.momentum * self.deltas[param]
+      if self.variance_reduction:
+        self.start_var_reduction = 0
+        self.use_corrected_grad = True
+        self.decay = 0.9 #75
+        self.delta_clip = 0 #50.0
+        self.gamma_clip = 2.5  # 1.8
+        eps = numpy.float32(1e-7)
+        deltas = deltas / (deltas.norm(2) + eps)
+
+        taus_x_t = self.var((numpy.ones_like(param.get_value()) + eps) * 2.1, name="taus_x_t_" + param.name)
+
+        # Variance reduction parameters
+        # Numerator of the gamma:
+        gamma_nume_sqr = self.var(numpy.zeros_like(param.get_value()) + eps, name="gamma_nume_sqr_" + param.name)
+        # Denominator of the gamma:
+        gamma_deno_sqr = self.var(numpy.zeros_like(param.get_value()) + eps, name="gamma_deno_sqr_" + param.name)
+        # For the covariance parameter := E[\gamma \alpha]_{t-1}
+        cov_num_t = self.var(numpy.zeros_like(param.get_value()) + eps, name="cov_num_t_" + param.name)
+        # mean_grad := E[g]_{t-1}
+        mean_grad = self.var(numpy.zeros_like(param.get_value()) + eps, name="mean_grad_%s" % param.name)
+        # mean_squared_grad := E[g^2]_{t-1}
+        mean_square_grad = self.var(numpy.zeros_like(param.get_value()) + eps, name="msg_" + param.name)
+        # mean_square_dx := E[(\Delta x)^2]_{t-1}
+        mean_square_dx = self.var(value=numpy.zeros_like(param.get_value()), name="msd_" + param.name)
+        old_grad = self.var(value=numpy.zeros_like(param.get_value()) + eps, name="old_grad_" + param.name)
+
+        # The uncorrected gradient of previous of the previous update:
+        old_plain_grad = self.var(numpy.zeros_like(param.get_value()) + eps, name="old_plain_grad_" + param.name)
+        mean_curvature = self.var(numpy.zeros_like(param.get_value()) + eps, name="mean_curvature_" + param.name)
+        mean_curvature_sqr = self.var(numpy.zeros_like(param.get_value()) + eps,
+                                      name="mean_curvature_sqr_" + param.name)
+
+        # Initialize the E[\Delta]_{t-1}
+        mean_dx = self.var(numpy.zeros_like(param.get_value()), name="mean_dx_" + param.name)
+
+        # Block-wise normalize the gradient:
+        # For the first time-step, assume that delta_x_t := deltas
+        cond = T.eq(self.i, 0)
+        msdx = cond * deltas ** 2 + (1 - cond) * mean_square_dx
+        mdx = cond * deltas + (1 - cond) * mean_dx
+
+        """
+        Compute the new updated values.
+        """
+        # E[g_i^2]_t
+        new_mean_squared_grad = mean_square_grad * self.decay + T.sqr(deltas) * (1 - self.decay)
+        new_mean_squared_grad.name = "msg_" + param.name
+        # E[g_i]_t
+        new_mean_grad = mean_grad * self.decay + deltas * (1 - self.decay)
+        new_mean_grad.name = "nmg_" + param.name
+        # Keep the rms for numerator and denominator of gamma.
+        new_gamma_nume_sqr = gamma_nume_sqr * (1 - 1 / taus_x_t) + T.sqr(
+          (deltas - old_grad) * (old_grad - new_mean_grad)) / taus_x_t
+        new_gamma_nume_sqr.name = "ngammasqr_num_" + param.name
+        new_gamma_deno_sqr = gamma_deno_sqr * (1 - 1 / taus_x_t) + T.sqr(
+          (new_mean_grad - deltas) * (old_grad - new_mean_grad)) / taus_x_t
+        new_gamma_deno_sqr.name = "ngammasqr_den_" + param.name
+
+        gamma = T.sqrt(gamma_nume_sqr) / T.sqrt(gamma_deno_sqr + eps)
+        gamma.name = "gamma_" + param.name
+
+        if self.gamma_clip:
+          gamma = T.minimum(gamma, self.gamma_clip)
+
+        momentum_step = gamma * new_mean_grad
+        corrected_grad_cand = (deltas + momentum_step) / (1 + gamma)
+
+        # For starting the variance reduction.
+        if self.start_var_reduction > -1:
+          cond = T.le(self.start_var_reduction, self.i)
+          corrected_grad = cond * corrected_grad_cand + (1 - cond) * deltas
+        else:
+          corrected_grad = deltas
+
+        # Use the gradients from the previous update
+        # to compute the \nabla f(x_t) - \nabla f(x_{t-1})
+        cur_curvature = deltas - old_plain_grad
+        new_curvature_ave = mean_curvature * (1 - 1 / taus_x_t) + cur_curvature / taus_x_t
+        new_curvature_ave.name = "ncurve_ave_" + param.name
+
+        # Average average curvature
+        nc_ave = new_curvature_ave
+        new_curvature_sqr_ave = mean_curvature_sqr * (1 - 1 / taus_x_t) + T.sqr(cur_curvature) / taus_x_t
+        new_curvature_sqr_ave.name = "ncurve_sqr_ave_" + param.name
+
+        # Unbiased average squared curvature
+        nc_sq_ave = new_curvature_sqr_ave
+
+        slope = self.learning_rate_var
+        rms_dx_tm1 = T.sqrt(msdx + slope)
+        rms_curve_t = T.sqrt(new_curvature_sqr_ave + slope)
+
+        # This is where the update step is being defined
+        # delta_x_t = -scaled_lr * (rms_dx_tm1 / rms_curve_t - cov_num_t / (new_curvature_sqr_ave + epsilon))
+        delta_x_t = -(rms_dx_tm1 / rms_curve_t - cov_num_t / (new_curvature_sqr_ave + self.learning_rate_var))
+        delta_x_t.name = "delta_x_t_" + param.name
+        delta_x_t = delta_x_t * corrected_grad
+
+        new_taus_t = (1 - T.sqr(mdx) / (msdx + eps)) * taus_x_t + self.var(1 + eps, name="stabilized")
+        # To compute the E[\Delta^2]_t
+        new_mean_square_dx = msdx * (1 - 1 / taus_x_t) + T.sqr(delta_x_t) / taus_x_t
+        # To compute the E[\Delta]_t
+        new_mean_dx = mean_dx * (1 - 1 / taus_x_t) + delta_x_t / taus_x_t
+
+        # Perform the outlier detection:
+        # This outlier detection is slightly different:
+        self.upper_bound_tau = 1e8
+        self.lower_bound_tau = 1.5
+        new_taus_t = T.switch(
+          T.or_(abs(deltas - new_mean_grad) > (2 * T.sqrt(new_mean_squared_grad - new_mean_grad ** 2)),
+                abs(cur_curvature - nc_ave) > (2 * T.sqrt(nc_sq_ave - nc_ave ** 2))),
+          self.var(2.2), new_taus_t)
+
+        # Apply the bound constraints on tau:
+        new_taus_t = T.maximum(self.lower_bound_tau, new_taus_t)
+        new_taus_t = T.minimum(self.upper_bound_tau, new_taus_t)
+
+        new_cov_num_t = cov_num_t * (1 - 1 / taus_x_t) + (delta_x_t * cur_curvature) * (1 / taus_x_t)
+        deltas = -delta_x_t
+
+        # Apply updates
+        updates.append((mean_square_grad, new_mean_squared_grad))
+        updates.append((mean_square_dx, new_mean_square_dx))
+        updates.append((mean_dx, new_mean_dx))
+        updates.append((gamma_nume_sqr, new_gamma_nume_sqr))
+        updates.append((gamma_deno_sqr, new_gamma_deno_sqr))
+        updates.append((taus_x_t, new_taus_t))
+        updates.append((cov_num_t, new_cov_num_t))
+        updates.append((mean_grad, new_mean_grad))
+        updates.append((old_plain_grad, deltas))
+        updates.append((mean_curvature, new_curvature_ave))
+        updates.append((mean_curvature_sqr, new_curvature_sqr_ave))
+        updates.append((old_grad, corrected_grad))
+
       if self.adasecant:
         # https://github.com/caglar/adasecant_wshp_paper/blob/master/adasecant/codes/learning_rule.py
         self.use_adam = False
         self.use_adagrad = False
         self.use_adadelta = False
-        self.skip_nan_inf = False
-        self.start_var_reduction = 0
+        self.skip_nan_inf = True
+        self.start_var_reduction = 1
         self.use_corrected_grad = True
         self.decay = 0.75
         self.delta_clip = 50.0
-        self.gamma_clip = 2.5 #1.8
+        self.gamma_clip = 1.8
         eps = numpy.float32(1e-7)
-        deltas = deltas / (deltas.norm(2) + eps)
+        if not self.gradient_l2_norm:
+          deltas = deltas / (deltas.norm(2) + eps)
         if self.use_adagrad:
           sum_square_grad = self.var(param.get_value(borrow=True) * 0., name="sum_square_grad_%s" % param.name, broadcastable=param.broadcastable)
         if self.use_adadelta:
@@ -747,31 +888,20 @@ class Updater:
         #upd = upd * 0.1 / (0.1 + (self.sqrsum[param] + deltas ** 2) ** 0.5)
 
       elif self.adamdelta: # adam moment normalization + adadelta learning rate scaling
-        m_cache = self.var(1, name="momemtum_cache")
-        m_prev = self.var(param, zero=True, name="nadam_m_%s" % param.name)
-        v_prev = self.var(param, zero=True, name="nadam_v_%s" % param.name)
-        self.adam_offset = numpy.float32(1e-8)
+        self.adam_offset = numpy.float32(1e-16)
+        m_prev = self.var(param, zero=True, name="adam_m_%s" % param.name)
+        v_prev = self.var(param, zero=True, name="adam_v_%s" % param.name)
 
-        mt = (beta1 * (1 - 0.5 * 0.96 ** (
-        i_t * float(self.nadam_decay))))  # momentum schedule, http://www.cs.toronto.edu/~fritz/absps/momentum.pdf
-        mtnext = beta1 * (1 - 0.5 * 0.96 ** ((i_t + 1) * float(self.nadam_decay)))  # for simplified NAG
+        m_t = beta1 * m_prev + (numpy.float32(1) - beta1) * deltas
+        v_t = beta2 * v_prev + (numpy.float32(1) - beta2) * deltas ** 2
+        g = m_t / (T.sqrt(v_t) + self.adam_offset)
 
-        m_cache_new = m_cache * mt
-        bias_corr = m_cache_new * mtnext
-
-        _deltas = deltas / T.cast(1 - m_cache_new, dtype="float32")
-
-        m = beta1 * m_prev + (numpy.float32(1) - beta1) * deltas
-        _m = m / T.cast(1 - bias_corr,
-                        dtype="float32")  # bias correction (with momentum schedule (include the next t+1))
-
-        v = beta2 * v_prev + (numpy.float32(1) - beta2) * (deltas ** 2)
-        _v = v / T.cast(1 - beta2 ** i_t, dtype="float32")
-        __m = T.cast(1 - mt, dtype="float32") * _deltas + T.cast(mtnext, dtype="float32") * _m
-        g = __m / (T.sqrt(_v) + self.adam_offset)
+        updates.append((m_prev, m_t))
+        updates.append((v_prev, v_t))
 
         decay = self.adadelta_decay
         offset = self.adadelta_offset
+        g = deltas
         g2 = g ** 2
         eg2_new = decay * self.eg2[param] + (numpy.float32(1) - decay) * g2
         dx_new = - g * T.sqrt(self.edx2[param] + offset) / T.sqrt(eg2_new + offset)
@@ -782,9 +912,6 @@ class Updater:
         updates.append((self.eg2[param], eg2_new))
         updates.append((self.edx2[param], edx2_new))
         updates.append((self.dx[param], dx_new))
-        updates.append((m_cache, m_cache_new))
-        updates.append((m_prev, m))
-        updates.append((v_prev, v))
 
       elif self.adadelta:
         decay = self.adadelta_decay
@@ -934,7 +1061,7 @@ class Updater:
         ps += [p]
         upd = upd * T.tri(p.shape[0], p.shape[1], dtype="float32")
         updates[i] = (p, upd)
-      print >>log.v4, "enforce_triangular_matrix_zero for:", ps
+      print("enforce_triangular_matrix_zero for:", ps, file=log.v4)
 
     #for u in updates:
     #  print ">>>>", u

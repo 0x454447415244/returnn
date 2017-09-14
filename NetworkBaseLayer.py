@@ -1,3 +1,6 @@
+
+from __future__ import print_function
+
 from math import sqrt
 import numpy
 from theano import tensor as T
@@ -84,7 +87,7 @@ class Container(object):
       try:
         grp.attrs[p] = v
       except TypeError:
-        print >> log.v3, "warning: invalid type of attribute %r (%s) in layer %s" % (p, type(v), self.name)
+        print("warning: invalid type of attribute %r (%s) in layer %s" % (p, type(v), self.name), file=log.v3)
 
   def load(self, head):
     """
@@ -93,7 +96,7 @@ class Container(object):
     try:
       grp = head[self.name]
     except Exception:
-      print >> log.v3, "warning: unable to load parameters for layer", self.name
+      print("warning: unable to load parameters for layer", self.name, file=log.v3)
       return
 
     grp_class = as_str(grp.attrs['class'])
@@ -101,10 +104,10 @@ class Container(object):
     if grp_class != self.layer_class:
       from NetworkLayer import get_layer_class
       if not get_layer_class(grp_class, raise_exception=False) is get_layer_class(self.layer_class):
-        print >>log.v3, "warning: invalid layer class (expected " + self.layer_class + " got " + grp.attrs['class'] + ")"
+        print("warning: invalid layer class (expected " + self.layer_class + " got " + grp.attrs['class'] + ")", file=log.v3)
     for p in self.params:
       if p not in grp:
-        print >> log.v4, "unable to load parameter %s in %s" % (p, self.name)
+        print("unable to load parameter %s in %s" % (p, self.name), file=log.v4)
     for p in grp:
       if p in self.params:
         if self.params[p].get_value(borrow=True, return_internal_type=True).shape == grp[p].shape:
@@ -112,15 +115,15 @@ class Container(object):
           assert not (numpy.isinf(array).any() or numpy.isnan(array).any())
           self.params[p].set_value(array)
         else:
-          print >> log.v2, "warning: invalid layer parameter shape for parameter " + p + " of layer " + self.name + \
+          print("warning: invalid layer parameter shape for parameter " + p + " of layer " + self.name + \
             " (expected  " + str(self.params[p].get_value(borrow=True, return_internal_type=True).shape) + \
-            " got " + str(grp[p].shape) + ")"
+            " got " + str(grp[p].shape) + ")", file=log.v2)
           #assert self.params[p].get_value(borrow=True, return_internal_type=True).shape == grp[p].shape, \
           #  "invalid layer parameter shape for parameter " + p + " of layer " + self.name + \
           #  " (expected  " + str(self.params[p].get_value(borrow=True, return_internal_type=True).shape) + \
           #  " got " + str(grp[p].shape) + ")"
       else:
-        print >> log.v4, "unable to match parameter %s in %s" % (p, self.name)
+        print("unable to match parameter %s in %s" % (p, self.name), file=log.v4)
     #for p in self.attrs.keys():
     #  att = grp.attrs.get(p, None)
     #  if att != None:
@@ -395,6 +398,8 @@ class Container(object):
     for k in attrs.keys():
       if isinstance(attrs[k], numpy.bool_):
         attrs[k] = True if attrs[k] else False
+      if isinstance(attrs[k], bytes):
+        attrs[k] = attrs[k].decode("utf8")
     if 'from' in attrs:
       if attrs['from'] == 'data':
         attrs.pop('from', None)
@@ -471,7 +476,7 @@ class Layer(Container):
                L1=0.0, L2=0.0, L2_eye=None, varreg=0.0,
                output_L2_reg=0.0, output_entropy_reg=0.0, output_entropy_exp_reg=0.0,
                with_bias=True,
-               mask="unity", dropout=0.0, batch_drop=False, batch_norm=False, layer_drop=0.0, residual=False,
+               mask="unity", dropout=0.0, batch_drop=False, batch_norm=False, bn_use_sample=False, layer_drop=0.0, residual=False,
                carry=False,
                sparse_filtering=False, gradient_scale=1.0, trainable=True, device=None,
                dtype='float32',
@@ -488,10 +493,12 @@ class Layer(Container):
     self.index = index
     self.sources = sources; ":type: list[Layer]"
     self.num_sources = len(sources)
+    self.D = max([s.D for s in sources if isinstance(s,Layer)] + [0])
     if mask is None: mask = 'none'
     self.set_attr('mask', mask)
     self.set_attr('dropout', dropout)
     self.set_attr('sparse', sparse)
+    self.set_attr('bn_use_sample', bn_use_sample)
     self.set_attr('sparse_filtering', sparse_filtering)
     if not trainable:
       self.set_attr('trainable', trainable)  # only store if not default
@@ -688,7 +695,7 @@ class Layer(Container):
       assert False, "consensus method unknown: " + cns
 
   def batch_norm(self, h, dim, use_shift=True, use_std=True, use_sample=0.0, force_sample=False, index=None,
-                 sample_mean=None, gamma=None, beta=None):
+                 sample_mean=None, gamma=None, beta=None, depth_norm=False):
     x = h
     if h.ndim == 3:
       if index is None: index = self.index
@@ -734,16 +741,18 @@ class Layer(Container):
         beta = self.add_param(self.shared(numpy.zeros((dim,), 'float32'), "%s_%s_beta" % (self.name,h.name)))
       self.beta = beta
       bn += beta
+    if depth_norm:
+      bn = bn / (T.sqrt(2)**self.D)
     return bn
 
-  def make_output(self, output, collapse = True):
+  def make_output(self, output, collapse = True, sample_mean=None, gamma=None):
     self.output = output
     if collapse and self.depth > 1:
       self.output = self.make_consensus(self.output)
       if self.attrs['consensus'] == 'flat':
         self.attrs['n_out'] *= self.depth
     if self.attrs['batch_norm']:
-      self.output = self.batch_norm(self.output, self.attrs['n_out'])
+      self.output = self.batch_norm(self.output, self.attrs['n_out'], sample_mean=sample_mean, gamma=gamma, use_sample=self.attrs['bn_use_sample'])
     if self.attrs['residual']:
       from NetworkHiddenLayer import concat_sources
       z, n_in = concat_sources(self.sources, unsparse=True, expect_source=False)
@@ -755,7 +764,7 @@ class Layer(Container):
       z, n_in = concat_sources(self.sources, unsparse=True, expect_source=False)
       n_out = self.attrs['n_out']
       if n_in != n_out:
-        print >>log.v4, "Layer drop with additional projection %i -> %i" % (n_in, n_out)
+        print("Layer drop with additional projection %i -> %i" % (n_in, n_out), file=log.v4)
         if n_in > 0:
           self.W_drop = self.add_param(self.create_forward_weights(n_in, n_out, name="W_drop_%s" % self.name))
           z = T.dot(z, self.W_drop)

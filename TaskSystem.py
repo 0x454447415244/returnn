@@ -4,10 +4,12 @@ Here are all subprocess, threading etc related utilities,
 most of them quite low level.
 """
 
+from __future__ import print_function
 from threading import Lock, currentThread
 import sys
 PY3 = sys.version_info[0] >= 3
 import os
+import io
 if PY3:
   from io import BytesIO
 else:
@@ -22,6 +24,12 @@ from importlib import import_module
 import errno
 import time
 import numpy
+try:
+  from _multiprocessing import Connection
+except ImportError:
+  from multiprocessing.connection import Connection
+
+_abs_mod_file = os.path.abspath(__file__)
 
 
 def execInMainProc(func):
@@ -143,88 +151,97 @@ class SharedMem:
   class ShmException(Exception): pass
   class CCallException(ShmException): pass
 
-  import ctypes
-  import ctypes.util
-
-  libc_so = ctypes.util.find_library('c')
-  libc = ctypes.CDLL(libc_so, use_errno=True)
-  shm_key_t = ctypes.c_int
-  IPC_PRIVATE = 0
-  IPC_RMID = 0
-
-  # int shmget(key_t key, size_t size, int shmflg);
-  shmget = libc.shmget
-  shmget.restype = ctypes.c_int
-  shmget.argtypes = (shm_key_t, ctypes.c_size_t, ctypes.c_int)
-  # void* shmat(int shmid, const void *shmaddr, int shmflg);
-  shmat = libc.shmat
-  shmat.restype = ctypes.c_void_p
-  shmat.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
-  # int shmdt(const void *shmaddr);
-  shmdt = libc.shmdt
-  shmdt.restype = ctypes.c_int
-  shmdt.argtypes = (ctypes.c_void_p,)
-  # int shmctl(int shmid, int cmd, struct shmid_ds *buf);
-  shmctl = libc.shmctl
-  shmctl.restype = ctypes.c_int
-  shmctl.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
-  # void* memcpy( void *dest, const void *src, size_t count );
-  memcpy = libc.memcpy
-  memcpy.restype = ctypes.c_void_p
-  memcpy.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
-
-  @classmethod
-  def check_ccall_error(cls, check, f):
+  if sys.platform != "win32":
     import ctypes
-    if not check:
-      errno = ctypes.get_errno()
-      errstr = os.strerror(errno)
-      raise cls.CCallException("SharedMem: %s failed with error %i (%s)" % (f, errno, errstr))
+    import ctypes.util
 
-  def __init__(self, size, shmid=None):
-    self.size = size
-    self.shmid = None
-    self.ptr = None
-    if shmid is None:
-      self.is_creator = True
-      self.shmid = self.shmget(self.IPC_PRIVATE, self.size, 0o600)
-      self.check_ccall_error(self.shmid > 0, "shmget")
-      print("SharedMem[pid %i]: New shmid: %i (size %i)" % (os.getpid(), self.shmid, self.size))
-      import atexit
-      atexit.register(self.remove)
-    else:
-      self.is_creator = False
-      self.shmid = shmid
-      assert self.shmid > 0
-    self.ptr = self.shmat(self.shmid, 0, 0)
-    self.check_ccall_error(self.ptr != self.ctypes.c_void_p(-1).value, "shmat")
-    self.check_ccall_error(self.ptr > 0, "shmat")
+    libc_so = ctypes.util.find_library('c')
+    libc = ctypes.CDLL(libc_so, use_errno=True)
+    shm_key_t = ctypes.c_int
+    IPC_PRIVATE = 0
+    IPC_RMID = 0
 
-  def remove(self):
-    if self.ptr:
-      self.shmdt(self.ptr)
-      self.ptr = None
-    if self.shmid:
-      if self.is_creator:
-        print("SharedMem[pid %i]: Removing shmid %i (size %i)" % (os.getpid(), self.shmid, self.size))
-        self.shmctl(self.shmid, self.IPC_RMID, 0)
+    # int shmget(key_t key, size_t size, int shmflg);
+    shmget = libc.shmget
+    shmget.restype = ctypes.c_int
+    shmget.argtypes = (shm_key_t, ctypes.c_size_t, ctypes.c_int)
+    # void* shmat(int shmid, const void *shmaddr, int shmflg);
+    shmat = libc.shmat
+    shmat.restype = ctypes.c_void_p
+    shmat.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
+    # int shmdt(const void *shmaddr);
+    shmdt = libc.shmdt
+    shmdt.restype = ctypes.c_int
+    shmdt.argtypes = (ctypes.c_void_p,)
+    # int shmctl(int shmid, int cmd, struct shmid_ds *buf);
+    shmctl = libc.shmctl
+    shmctl.restype = ctypes.c_int
+    shmctl.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+    # void* memcpy( void *dest, const void *src, size_t count );
+    memcpy = libc.memcpy
+    memcpy.restype = ctypes.c_void_p
+    memcpy.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
+
+    @classmethod
+    def check_ccall_error(cls, check, f):
+      import ctypes
+      if not check:
+        errno = ctypes.get_errno()
+        errstr = os.strerror(errno)
+        raise cls.CCallException("SharedMem: %s failed with error %i (%s)" % (f, errno, errstr))
+
+    @classmethod
+    def is_shmget_functioning(cls):
+      shmid = cls.shmget(cls.IPC_PRIVATE, 4 * 1024 * 1024, 0o600)
+      if shmid <= 0:
+        return False
+      cls.shmctl(shmid, cls.IPC_RMID, 0)
+      return True
+
+    def __init__(self, size, shmid=None):
+      self.size = size
       self.shmid = None
+      self.ptr = None
+      if shmid is None:
+        self.is_creator = True
+        self.shmid = self.shmget(self.IPC_PRIVATE, self.size, 0o600)
+        self.check_ccall_error(self.shmid > 0, "shmget")
+        print("SharedMem[pid %i]: New shmid: %i (size %i)" % (os.getpid(), self.shmid, self.size))
+        import atexit
+        atexit.register(self.remove)
+      else:
+        self.is_creator = False
+        self.shmid = shmid
+        assert self.shmid > 0
+      self.ptr = self.shmat(self.shmid, 0, 0)
+      self.check_ccall_error(self.ptr != self.ctypes.c_void_p(-1).value, "shmat")
+      self.check_ccall_error(self.ptr > 0, "shmat")
 
-  def __del__(self):
-    self.remove()
+    def remove(self):
+      if self.ptr:
+        self.shmdt(self.ptr)
+        self.ptr = None
+      if self.shmid and self.shmid > 0:
+        if self.is_creator:
+          print("SharedMem[pid %i]: Removing shmid %i (size %i)" % (os.getpid(), self.shmid, self.size))
+          self.shmctl(self.shmid, self.IPC_RMID, 0)
+        self.shmid = None
 
-  def __getstate__(self):
-    return {"size": self.size, "shmid": self.shmid}
+    def __del__(self):
+      self.remove()
 
-  def __setstate__(self, state):
-    self.__init__(**state)
+    def __getstate__(self):
+      return {"size": self.size, "shmid": self.shmid}
 
-  def __repr__(self):
-    return "<SharedMem shmid=%r size=%r is_creator=%r>" % (self.shmid, self.size, self.is_creator)
+    def __setstate__(self, state):
+      self.__init__(**state)
+
+    def __repr__(self):
+      return "<SharedMem shmid=%r size=%r is_creator=%r>" % (self.shmid, self.size, self.is_creator)
 
 
 def next_power_of_two(n):
-  return 2 ** ((n - 1).bit_length())
+  return 2 ** (int(n - 1).bit_length())
 
 
 class SharedNumpyArray:
@@ -524,8 +541,22 @@ else:
 def makeFuncCell(value):
   return get_func_closure((lambda: value))[0]
 
-def getModuleDict(modname):
-  mod = import_module(modname)
+def getModuleDict(modname, path=None):
+  """
+  :param str modname: such that "import <modname>" would work
+  :param list[str] path: sys.path
+  :return: the dict of the mod
+  :rtype: dict[str]
+  """
+  try:
+    mod = import_module(modname)
+  except ImportError:
+    # Try again with extended sys.path.
+    assert path
+    for p in path:
+      if p not in sys.path:
+        sys.path.append(p)
+    mod = import_module(modname)
   return mod.__dict__
 
 def getModNameForModDict(obj):
@@ -625,7 +656,11 @@ def numpy_alloc(shape, dtype, fortran_for_shared=False):
   return numpy.ndarray(shape, dtype=dtype)
 
 
-_BasePickler = getattr(pickle, "_Pickler", pickle.Pickler)
+try:
+  _BasePickler = pickle._Pickler  # use the pure Python implementation
+except AttributeError:
+  _BasePickler = pickle.Pickler
+
 
 class Pickler(_BasePickler):
   """
@@ -636,7 +671,7 @@ class Pickler(_BasePickler):
   def __init__(self, *args, **kwargs):
     if not "protocol" in kwargs:
       kwargs["protocol"] = pickle.HIGHEST_PROTOCOL
-    pickle.Pickler.__init__(self, *args, **kwargs)
+    _BasePickler.__init__(self, *args, **kwargs)
   dispatch = _BasePickler.dispatch.copy()
 
   def save_func(self, obj):
@@ -661,7 +696,10 @@ class Pickler(_BasePickler):
       pass
     assert type(obj) is types.MethodType
     self.save(types.MethodType)
-    self.save((obj.im_func, obj.im_self, obj.im_class))
+    if PY3:
+      self.save((obj.__func__, obj.__self__))
+    else:
+      self.save((obj.im_func, obj.im_self, obj.im_class))
     self.write(pickle.REDUCE)
     self.memoize(obj)
   dispatch[types.MethodType] = save_method
@@ -688,7 +726,7 @@ class Pickler(_BasePickler):
     modname = getModNameForModDict(obj)
     if modname:
       self.save(getModuleDict)
-      self.save((modname,))
+      self.save((modname, sys.path))
       self.write(pickle.REDUCE)
       self.memoize(obj)
       return
@@ -718,7 +756,7 @@ class Pickler(_BasePickler):
     # and use a separate write for the obj itself.
     # For a huge obj, this avoids one unnecessary copy of the data.
     self.write(pickle.BINSTRING + pack("<i", len(obj)))
-    self.write(obj)
+    self.write(bytes(obj, "utf8"))
   dispatch[str] = save_string
 
   def save_ndarray(self, obj):
@@ -738,6 +776,12 @@ class Pickler(_BasePickler):
     self.save((obj.tostring(), str(obj.dtype), obj.shape))
     self.write(pickle.REDUCE)
   dispatch[numpy.ndarray] = save_ndarray
+
+  def save_iobuffer_dummy(self, obj):
+    # Not supported but we want to not fail and just store None.
+    self.save_none(None)
+  dispatch[io.BufferedReader] = save_iobuffer_dummy
+  dispatch[io.BufferedWriter] = save_iobuffer_dummy
 
   # Overwrite to avoid the broken pickle.whichmodule() which might return "__main__".
   def save_global(self, obj, name=None):
@@ -767,7 +811,7 @@ class Pickler(_BasePickler):
 
     assert "\n" not in module
     assert "\n" not in name
-    self.write(pickle.GLOBAL + module + '\n' + name + '\n')
+    self.write(pickle.GLOBAL + bytes(module + '\n' + name + '\n', "utf8"))
     self.memoize(obj)
 
   def save_type(self, obj):
@@ -780,9 +824,9 @@ class Pickler(_BasePickler):
     # such as types.FunctionType. This is fixed here.
     for modname in ["types"]:
       moddict = sys.modules[modname].__dict__
-      for modobjname,modobj in moddict.iteritems():
+      for modobjname,modobj in moddict.items():
         if modobj is obj:
-          self.write(pickle.GLOBAL + modname + '\n' + modobjname + '\n')
+          self.write(pickle.GLOBAL + bytes(modname + '\n' + modobjname + '\n', "utf8"))
           self.memoize(obj)
           return
     # Generic serialization of new-style classes.
@@ -844,8 +888,12 @@ class ExecingProcess:
     assert self.exit_status is None
     def pipeOpen():
       readend, writeend = os.pipe()
-      readend = os.fdopen(readend, "r")
-      writeend = os.fdopen(writeend, "w")
+      if hasattr(os, "set_inheritable"):
+        # Python 3 by default will close all fds in subprocesses. This will avoid that.
+        os.set_inheritable(readend, True)
+        os.set_inheritable(writeend, True)
+      readend = os.fdopen(readend, "rb")
+      writeend = os.fdopen(writeend, "wb")
       return readend, writeend
     self.pipe_c2p = pipeOpen()
     self.pipe_p2c = pipeOpen()
@@ -860,12 +908,12 @@ class ExecingProcess:
     else:
       flags['base_compiledir'] = '/tmp/theano/' + self.name.replace(' ','_')
     os.environ["THEANO_FLAGS"] = ",".join(["=".join(x) for x in flags.items()])
-    if pid == 0: # child
+    if pid == 0:  # child
       try:
         sys.stdin.close()  # Force no tty stdin.
         self.pipe_c2p[0].close()
         self.pipe_p2c[1].close()
-        py_mod_file = os.path.splitext(__file__)[0] + ".py"
+        py_mod_file = os.path.splitext(_abs_mod_file)[0] + ".py"
         assert os.path.exists(py_mod_file)
         args = [sys.executable,
                 py_mod_file,
@@ -881,7 +929,7 @@ class ExecingProcess:
         sys.exit(1)
       finally:
         sys.exit()
-    else: # parent
+    else:  # parent
       self.pipe_c2p[1].close()
       self.pipe_p2c[0].close()
       self.pid = pid
@@ -943,8 +991,8 @@ class ExecingProcess:
       argidx = sys.argv.index("--forkExecProc")
       writeFileNo = int(sys.argv[argidx + 1])
       readFileNo = int(sys.argv[argidx + 2])
-      readend = os.fdopen(readFileNo, "r")
-      writeend = os.fdopen(writeFileNo, "w")
+      readend = os.fdopen(readFileNo, "rb")
+      writeend = os.fdopen(writeFileNo, "wb")
       unpickler = Unpickler(readend)
       name = unpickler.load()
       if ExecingProcess.Verbose: print("ExecingProcess child %s (pid %i)" % (name, os.getpid()))
@@ -973,19 +1021,24 @@ class ProcConnectionDied(Exception):
 
 class ExecingProcess_ConnectionWrapper(object):
   """
-  Wrapper around _multiprocessing.Connection.
+  Wrapper around multiprocessing.connection.Connection.
   This is needed to use our own Pickler.
   """
 
   def __init__(self, fd=None, conn=None):
     self.fd = fd
     if self.fd:
-      from _multiprocessing import Connection
       self.conn = Connection(fd)
     elif conn:
       self.conn = conn
     else:
       self.conn = None
+
+  def __repr__(self):
+    if self.conn is not None:
+      return "<ExecingProcess_ConnectionWrapper fileno=%r>" % self.conn.fileno()
+    else:
+      return "<ExecingProcess_ConnectionWrapper None>"
 
   def __getstate__(self):
     if self.fd is not None:
@@ -994,17 +1047,24 @@ class ExecingProcess_ConnectionWrapper(object):
       return {"conn": self.conn}  # Try to pickle the connection.
     else:
       return {}
+
   def __setstate__(self, state):
     self.__init__(**state)
 
-  def __getattr__(self, attr): return getattr(self.conn, attr)
+  def __getattr__(self, attr):
+    return getattr(self.conn, attr)
 
   def _check_closed(self):
-    if self.conn.closed: raise ProcConnectionDied("connection closed")
+    if self.conn.closed:
+      raise ProcConnectionDied("connection closed")
+
   def _check_writable(self):
-    if not self.conn.writable: raise ProcConnectionDied("connection not writeable")
+    if not self.conn.writable:
+      raise ProcConnectionDied("connection not writeable")
+
   def _check_readable(self):
-    if not self.conn.readable: raise ProcConnectionDied("connection not readable")
+    if not self.conn.readable:
+      raise ProcConnectionDied("connection not readable")
 
   def poll(self, *args, **kwargs):
     while True:
@@ -1061,10 +1121,17 @@ def ExecingProcess_Pipe():
   """
   import socket
   s1, s2 = socket.socketpair()
-  c1 = ExecingProcess_ConnectionWrapper(os.dup(s1.fileno()))
-  c2 = ExecingProcess_ConnectionWrapper(os.dup(s2.fileno()))
+  # We duplicate the fds because the socket objects will close the fds after they go out of scope.
+  fd1 = os.dup(s1.fileno())
+  fd2 = os.dup(s2.fileno())
   s1.close()
   s2.close()
+  if hasattr(os, "set_inheritable"):
+    # Python 3 by default will close all fds in subprocesses. This will avoid that.
+    os.set_inheritable(fd1, True)
+    os.set_inheritable(fd2, True)
+  c1 = ExecingProcess_ConnectionWrapper(fd1)
+  c2 = ExecingProcess_ConnectionWrapper(fd2)
   return c1, c2
 
 
@@ -1077,7 +1144,10 @@ def Pipe_ConnectionWrapper(*args, **kwargs):
 
 
 if sys.platform == "win32":
-  from multiprocessing.forking import Popen as mp_Popen
+  try:
+    from multiprocessing.forking import Popen as mp_Popen
+  except ImportError:
+    from multiprocessing.popen_spawn_win32 import Popen as mp_Popen
 
   class Win32_mp_Popen_wrapper:
     def __init__(self, env_update):
@@ -1182,8 +1252,15 @@ class AsyncTask:
   @staticmethod
   def _asyncCall(self):
     assert self.isChild
-    self.parent_conn.close()
-    self.conn = self.child_conn # we are the child
+    assert isinstance(self.parent_conn, (ExecingProcess_ConnectionWrapper, Connection))
+    parent_conn_handle = self.parent_conn.fileno()
+    try:
+      self.parent_conn.close()
+    except Exception:
+      # Print this here because in the backtrace, the handle will likely be reset already.
+      print("parent connection close failed; file handle was: %r" % parent_conn_handle)
+      raise
+    self.conn = self.child_conn  # we are the child
     if not self.mustExec and sys.platform != "win32":
       global isFork
       isFork = True

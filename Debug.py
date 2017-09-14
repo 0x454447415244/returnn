@@ -2,6 +2,11 @@
 import os
 import sys
 import signal
+try:
+  import thread
+except ImportError:
+  import _thread as thread
+import threading
 
 
 signum_to_signame = {
@@ -22,25 +27,41 @@ def auto_exclude_all_new_threads(func):
   return wrapped
 
 
-def dumpAllThreadTracebacks(exclude_thread_ids=set()):
+def dumpAllThreadTracebacks(exclude_thread_ids=set(), exclude_self=False):
   import better_exchook
   import threading
+
+  if exclude_self:
+    exclude_thread_ids = set(list(exclude_thread_ids) + [threading.current_thread().ident])
 
   if hasattr(sys, "_current_frames"):
     print("")
     threads = {t.ident: t for t in threading.enumerate()}
-    for tid, stack in sys._current_frames().items():
-      if tid in exclude_thread_ids: continue
+    for tid, stack in sorted(sys._current_frames().items()):
       # This is a bug in earlier Python versions.
       # http://bugs.python.org/issue17094
       # Note that this leaves out all threads not created via the threading module.
       if tid not in threads: continue
-      print("Thread %s:" % threads.get(tid, "unnamed with id %i" % tid))
+      tags = []
+      thread = threads.get(tid)
+      if thread:
+        assert isinstance(thread, threading.Thread)
+        if thread is threading.currentThread():
+          tags += ["current"]
+        if isinstance(thread, threading._MainThread):
+          tags += ["main"]
+        tags += [str(thread)]
+      else:
+        tags += ["unknown with id %i" % tid]
+      print("Thread %s:" % ", ".join(tags))
       if tid in global_exclude_thread_ids:
         print("(Auto-ignored traceback.)")
+      elif tid in exclude_thread_ids:
+        print("(Excluded thread.)")
       else:
-        better_exchook.print_tb(stack)
+        better_exchook.print_tb(stack, file=sys.stdout)
       print("")
+    print("That were all threads.")
   else:
     print("Does not have sys._current_frames, cannot get thread tracebacks.")
 
@@ -58,8 +79,6 @@ def setupWarnWithTraceback():
 
 
 def initBetterExchook():
-  import thread
-  import threading
   import better_exchook
   import pdb
 
@@ -174,14 +193,15 @@ def initFaulthandler(sigusr1_chain=False):
 
   :param bool sigusr1_chain: whether the default SIGUSR1 handler should also be called.
   """
-  # In case that sigusr1_chain, we expect that there is already some handler
-  # for SIGUSR1, and then this will not overwrite this handler.
-  if install_signal_handler_if_default(signal.SIGUSR1):
-    # There is already some handler or we installed our own handler now,
-    # so in any case, it's save that we chain then handler.
-    sigusr1_chain = True
-  # Why not also SIGUSR2... SGE can also send this signal.
-  install_signal_handler_if_default(signal.SIGUSR2)
+  if sys.platform != 'win32':
+    # In case that sigusr1_chain, we expect that there is already some handler
+    # for SIGUSR1, and then this will not overwrite this handler.
+    if install_signal_handler_if_default(signal.SIGUSR1):
+      # There is already some handler or we installed our own handler now,
+      # so in any case, it's save that we chain then handler.
+      sigusr1_chain = True
+    # Why not also SIGUSR2... SGE can also send this signal.
+    install_signal_handler_if_default(signal.SIGUSR2)
   try:
     import faulthandler
   except ImportError as e:
@@ -190,7 +210,7 @@ def initFaulthandler(sigusr1_chain=False):
     # Only enable if not yet enabled -- otherwise, leave it in its current state.
     if not faulthandler.is_enabled():
       faulthandler.enable()
-      if os.name != 'nt':
+      if sys.platform != 'win32':
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=sigusr1_chain)
   from Util import to_bool
   if os.environ.get("DEBUG_SIGNAL_HANDLER") and to_bool(os.environ.get("DEBUG_SIGNAL_HANDLER")):

@@ -1,4 +1,5 @@
-#! /usr/bin/python2.7
+
+from __future__ import print_function
 
 import numpy
 import sys
@@ -56,23 +57,34 @@ class Engine:
 
   @classmethod
   def get_existing_models(cls, config):
+    """
+    :param Config.Config config:
+    :return: dict epoch -> model filename
+    :rtype: dict[int,str]
+    """
     model_filename = config.value('model', '')
     if not model_filename:
       return []
     # Automatically search the filesystem for existing models.
-    file_list = []
+    file_list = {}
     for epoch in range(1, cls.config_get_final_epoch(config) + 1):
       for is_pretrain in [False, True]:
         fn = cls.epoch_model_filename(model_filename, epoch, is_pretrain)
         if os.path.exists(fn):
-          file_list += [(epoch, fn)]  # epoch, fn
+          file_list[epoch] = fn
           break
         if BackendEngine.is_tensorflow_selected():
           if os.path.exists(fn + ".index"):
-            file_list += [(epoch, fn)]  # epoch, fn
+            file_list[epoch] = fn
             break
-    file_list.sort()
     return file_list
+
+  @classmethod
+  def model_filename_postfix(cls):
+    fn_postfix = ""
+    if BackendEngine.is_tensorflow_selected():
+      fn_postfix = ".meta"
+    return fn_postfix
 
   @classmethod
   def get_epoch_model(cls, config):
@@ -94,16 +106,19 @@ class Engine:
 
     load_model_epoch_filename = config.value('load', '')
     if load_model_epoch_filename:
-      fn_postfix = ""
-      if BackendEngine.is_tensorflow_selected():
-        fn_postfix = ".meta"
-      assert os.path.exists(load_model_epoch_filename + fn_postfix)
+      assert os.path.exists(load_model_epoch_filename + cls.model_filename_postfix())
 
     import_model_train_epoch1 = config.value('import_model_train_epoch1', '')
     if import_model_train_epoch1:
-      assert os.path.exists(import_model_train_epoch1)
+      assert os.path.exists(import_model_train_epoch1 + cls.model_filename_postfix())
 
     existing_models = cls.get_existing_models(config)
+    if not load_model_epoch_filename:
+      if config.has("load_epoch"):
+        load_epoch = config.int("load_epoch", 0)
+        assert load_epoch in existing_models
+        load_model_epoch_filename = existing_models[load_epoch]
+        assert model_epoch_from_filename(load_model_epoch_filename) == load_epoch
 
     # Only use this when we don't train.
     # For training, we first consider existing models before we take the 'load' into account when in auto epoch mode.
@@ -119,9 +134,9 @@ class Engine:
     # This is because we reran CRNN training, we usually don't want to train from scratch
     # but resume where we stopped last time.
     elif existing_models:
-      epoch_model = existing_models[-1]
+      epoch_model = sorted(existing_models.items())[-1]
       if load_model_epoch_filename:
-        print >> log.v4, "note: there is a 'load' which we ignore because of existing model"
+        print("note: there is a 'load' which we ignore because of existing model", file=log.v4)
 
     elif config.value('task', 'train') == 'train' and import_model_train_epoch1 and start_epoch in [None, 1]:
       epoch_model = (0, import_model_train_epoch1)
@@ -137,13 +152,13 @@ class Engine:
 
     if start_epoch == 1:
       if epoch_model[0]:  # existing model
-        print >> log.v4, "warning: there is an existing model: %s" % (epoch_model,)
+        print("warning: there is an existing model: %s" % (epoch_model,), file=log.v4)
         epoch_model = (None, None)
-    elif start_epoch > 1:
+    elif (start_epoch or 0) > 1:
       if epoch_model[0]:
         if epoch_model[0] != start_epoch - 1:
-          print >> log.v4, "warning: start_epoch %i but there is %s" % (start_epoch, epoch_model)
-        epoch_model = existing_models[start_epoch-1]
+          print("warning: start_epoch %i but there is %s" % (start_epoch, epoch_model), file=log.v4)
+        epoch_model = start_epoch - 1, existing_models[start_epoch - 1]
 
     cls._epoch_model = epoch_model
     return epoch_model
@@ -224,19 +239,20 @@ class Engine:
   def init_network_from_config(self, config):
     self.pretrain = pretrainFromConfig(config)
     self.max_seqs = config.int('max_seqs', -1)
+    self.compression = config.bool('compression', False)
 
     epoch, model_epoch_filename = self.get_epoch_model(config)
     assert model_epoch_filename or self.start_epoch
 
     if model_epoch_filename:
-      print >> log.v2, "loading weights from", model_epoch_filename
+      print("loading weights from", model_epoch_filename, file=log.v2)
       last_model_hdf = h5py.File(model_epoch_filename, "r")
     else:
       last_model_hdf = None
 
     if config.bool('initialize_from_model', False):
       # That's only about the topology, not the params.
-      print >> log.v5, "initializing network topology from model"
+      print("initializing network topology from model", file=log.v5)
       assert last_model_hdf, "last model not specified. use 'load' in config. or don't use 'initialize_from_model'"
       network = LayerNetwork.from_hdf_model_topology(last_model_hdf)
     else:
@@ -259,13 +275,13 @@ class Engine:
       from NetworkCopyUtils import intelli_copy_layer
       # network.hidden are the input + all hidden layers.
       for layer_name, layer in sorted(old_network.hidden.items()):
-        print >> log.v3, "Copy hidden layer %s" % layer_name
+        print("Copy hidden layer %s" % layer_name, file=log.v3)
         intelli_copy_layer(layer, network.hidden[layer_name])
       for layer_name, layer in sorted(old_network.output.items()):
-        print >> log.v3, "Copy output layer %s" % layer_name
+        print("Copy output layer %s" % layer_name, file=log.v3)
         intelli_copy_layer(layer, network.output[layer_name])
-      print >> log.v3, "Not copied hidden: %s" % sorted(set(network.hidden.keys()).difference(old_network.hidden.keys()))
-      print >> log.v3, "Not copied output: %s" % sorted(set(network.output.keys()).difference(old_network.output.keys()))
+      print("Not copied hidden: %s" % sorted(set(network.hidden.keys()).difference(old_network.hidden.keys())), file=log.v3)
+      print("Not copied output: %s" % sorted(set(network.output.keys()).difference(old_network.output.keys())), file=log.v3)
 
     # Maybe load existing model parameters.
     elif last_model_hdf:
@@ -291,9 +307,9 @@ class Engine:
       print("---------------")
       print(json.dumps(json_data, indent=2, sort_keys=True))
       print("---------------")
-      print >> fout, json.dumps(json_data, indent=2, sort_keys=True)
+      print(json.dumps(json_data, indent=2, sort_keys=True), file=fout)
     except ValueError as e:
-      print >> log.v5, self.network.to_json()
+      print(self.network.to_json(), file=log.v5)
       assert False, "JSON parsing failed: %s" % e
     fout.close()
 
@@ -308,15 +324,15 @@ class Engine:
       if self.dev_data:
         if "dev_score" not in self.learning_rate_control.getEpochErrorDict(self.epoch):
           # This can happen when we have a previous model but did not test it yet.
-          print >> log.v4, "Last epoch model not yet evaluated on dev. Doing that now."
+          print("Last epoch model not yet evaluated on dev. Doing that now.", file=log.v4)
           self.eval_model()
 
   def train(self):
     if self.start_epoch:
-      print >> log.v3, "start training at epoch %i and batch %i" % (self.start_epoch, self.start_batch)
-    print >> log.v4, "using batch size: %i, max seqs: %i" % (self.batch_size, self.max_seqs)
-    print >> log.v4, "learning rate control:", self.learning_rate_control
-    print >> log.v4, "pretrain:", self.pretrain
+      print("start training at epoch %i and batch %i" % (self.start_epoch, self.start_batch), file=log.v3)
+    print("using batch size: %i, max seqs: %i" % (self.batch_size, self.max_seqs), file=log.v4)
+    print("learning rate control:", self.learning_rate_control, file=log.v4)
+    print("pretrain:", self.pretrain, file=log.v4)
     if self.network.loss == 'priori':
       prior = self.train_data.calculate_priori()
       self.network.output["output"].priori.set_value(prior)
@@ -331,8 +347,8 @@ class Engine:
     assert self.start_epoch >= 1, "Epochs start at 1."
     final_epoch = self.final_epoch if self.final_epoch != 0 else sys.maxsize
     if self.start_epoch > final_epoch:
-      print >> log.v1, "No epochs to train, start_epoch: %i, final_epoch: %i" % \
-                       (self.start_epoch, self.final_epoch)
+      print("No epochs to train, start_epoch: %i, final_epoch: %i" % \
+                       (self.start_epoch, self.final_epoch), file=log.v1)
 
     self.check_last_epoch()
     self.max_seq_length += (self.start_epoch - 1) * self.inc_seq_length
@@ -342,7 +358,7 @@ class Engine:
     while epoch <= final_epoch:
       if self.max_seq_length != sys.maxsize:
         if int(self.max_seq_length + self.inc_seq_length) != int(self.max_seq_length):
-          print >> log.v3, "increasing sequence lengths to", int(self.max_seq_length + self.inc_seq_length)
+          print("increasing sequence lengths to", int(self.max_seq_length + self.inc_seq_length), file=log.v3)
           rebatch = True
         self.max_seq_length += self.inc_seq_length
       # In case of random seq ordering, we want to reorder each epoch.
@@ -376,7 +392,7 @@ class Engine:
         self.save_model(self.get_epoch_model_filename(), self.epoch)
 
       if self.epoch != self.final_epoch:
-        print >> log.v3, "Stopped after epoch %i and not %i as planned." % (self.epoch, self.final_epoch)
+        print("Stopped after epoch %i and not %i as planned." % (self.epoch, self.final_epoch), file=log.v3)
 
     self.is_training = False
     self.training_finished = True
@@ -440,15 +456,15 @@ class Engine:
       self.network.declare_train_params()
 
     if self.init_train_epoch_posthook:
-      print >> log.v5, "execute init_train_epoch_posthook:", self.init_train_epoch_posthook
+      print("execute init_train_epoch_posthook:", self.init_train_epoch_posthook, file=log.v5)
       exec(self.init_train_epoch_posthook)
 
   def train_epoch(self):
-    print >> log.v4, "start", self.get_epoch_str(), "with learning rate", self.learning_rate, "..."
+    print("start", self.get_epoch_str(), "with learning rate", self.learning_rate, "...", file=log.v4)
 
     if self.epoch == 1 and self.save_epoch1_initial_model:
       epoch0_model_filename = self.epoch_model_filename(self.model_filename, 0, self.is_pretrain_epoch())
-      print >> log.v4, "save initial epoch1 model", epoch0_model_filename
+      print("save initial epoch1 model", epoch0_model_filename, file=log.v4)
       self.save_model(epoch0_model_filename, 0)
 
     if self.is_pretrain_epoch():
@@ -481,8 +497,8 @@ class Engine:
         self.save_model(self.get_epoch_model_filename() + ".crash_%i" % trainer.device_crash_batch, self.epoch - 1)
       sys.exit(1)
 
-    assert not any(numpy.isinf(trainer.score.values())) or any(numpy.isnan(trainer.score.values())), \
-      "Model is broken, got inf or nan final score: %s" % trainer.score
+    assert not any(numpy.isinf(list(trainer.score.values()))) or any(numpy.isnan(list(trainer.score.values()))), (
+      "Model is broken, got inf or nan final score: %s" % trainer.score)
 
     if self.model_filename and (self.epoch % self.save_model_epoch_interval == 0):
       self.save_model(self.get_epoch_model_filename(), self.epoch)
@@ -491,7 +507,7 @@ class Engine:
     if self.ctc_prior_file is not None:
       trainer.save_ctc_priors(self.ctc_prior_file, self.get_epoch_str())
 
-    print >> log.v1, self.get_epoch_str(), "score:", self.format_score(trainer.score), "elapsed:", hms(trainer.elapsed),
+    print(self.get_epoch_str(), "score:", self.format_score(trainer.score), "elapsed:", hms(trainer.elapsed), end=' ', file=log.v1)
     self.eval_model()
 
   def format_score(self, score):
@@ -525,14 +541,14 @@ class Engine:
       if dataset_name == "dev":
         self.learning_rate_control.setEpochError(self.epoch, {"dev_score": tester.score, "dev_error": tester.error})
         self.learning_rate_control.save()
-    print >> log.v1, " ".join(eval_dump_str).strip()
+    print(" ".join(eval_dump_str).strip(), file=log.v1)
 
   def save_model(self, filename, epoch):
     """
     :param str filename: full filename for model
     :param int epoch: save epoch idx
     """
-    print >> log.v4, "Save model from epoch %i under %s" % (epoch, filename)
+    print("Save model from epoch %i under %s" % (epoch, filename), file=log.v4)
     # We add some extra logic to try again for DiskQuota and other errors.
     # This could save us multiple hours of computation.
     try_again_wait_time = 10
@@ -544,8 +560,8 @@ class Engine:
         break
       except IOError as e:
         if e.errno in [errno.EBUSY, errno.EDQUOT, errno.EIO, errno.ENOSPC]:
-          print >> log.v3, "Exception while saving:", e
-          print >> log.v3, "Trying again in %s secs." % try_again_wait_time
+          print("Exception while saving:", e, file=log.v3)
+          print("Trying again in %s secs." % try_again_wait_time, file=log.v3)
           time.sleep(try_again_wait_time)
           continue
         raise
@@ -557,11 +573,9 @@ class Engine:
     :type combine_labels: str
     """
     cache = h5py.File(output_file, "w")
-    batches = data.generate_batches(recurrent_net=self.network.recurrent,
-                                    batch_size=batch_size,
-                                    max_seqs=self.max_seqs)
-    merge = {}
-    forwarder = HDFForwardTaskThread(self.network, self.devices, data, batches, cache, merge)
+    batches = data.generate_batches(recurrent_net=self.network.recurrent, batch_size=batch_size, max_seqs=self.max_seqs)
+    forwarder = HDFForwardTaskThread(self.network, self.devices, data, batches, cache,
+                                     "gzip" if self.compression else None)
     forwarder.join()
     cache.close()
 
@@ -575,10 +589,10 @@ class Engine:
   # ret = rpc.classify({"data":[[23],[0]], "classes" : [0,0], "classes-1" : [0,0], "classes-2" : [0,0], "classes-3" : [0,0], "classes-4" : [0,0]})
   # print rpc.result(ret['result']['hash'])
 
-  def daemon(self):
+  def daemon(self, config):
     network = self.network
     devices = self.devices
-    classifiers = {}
+    workers = {}
 
     def _classify(params):
       ret = { }
@@ -608,18 +622,22 @@ class Engine:
         else:
           batches = data.generate_batches(recurrent_net=network.recurrent,
                                           batch_size=sys.maxsize, max_seqs=1)
-          if not hash in classifiers:
-            classifiers[hash] = ClassificationTaskThread(network, devices, data, batches)
-            classifiers[hash].json_params = params
-            print >> log.v3, "classifier started:", hash
+          if not hash in workers:
+            workers[hash] = ClassificationTaskThread(network, devices, data, batches)
+            workers[hash].json_params = params
+            print("worker started:", hash, file=log.v3)
           ret['result'] = { 'hash' : hash }
       return ret
 
+    def _backprob(params):
+      ret = {}
+
+
     def _result(hash):
-      if not classifiers[hash].isAlive():
-        return { 'result' : { k : classifiers[hash].result[k].tolist() for k in classifiers[hash].result } }
+      if not workers[hash].isAlive():
+        return { 'result' : { k : workers[hash].result[k].tolist() for k in workers[hash].result } }
       else:
-        return { 'error' : "classification in progress"}
+        return { 'error' : "working ..."}
 
 
     class RequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
@@ -661,11 +679,11 @@ class Engine:
           ret = { 'error' : "" }
           self.path = self.path[1:].split('/')
           if self.path[0] in ['result']:
-            if self.path[1] in classifiers:
-              if not classifiers[self.path[1]].isAlive():
-                ret['result'] = { k : classifiers[self.path[1]].result[k].tolist() for k in classifiers[self.path[1]].result }
+            if self.path[1] in workers:
+              if not workers[self.path[1]].isAlive():
+                ret['result'] = { k : workers[self.path[1]].result[k] for k in workers[self.path[1]].result }
               else:
-                ret['error'] = "classification in progress"
+                ret['error'] = "working ..."
             else:
               ret['error'] = "unknown hash: " % self.path[1]
           else:
@@ -680,8 +698,9 @@ class Engine:
     class ThreadingServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):
       pass
 
-    httpd = ThreadingServer(("", 3333), RequestHandler)
-    print >> log.v3, "httpd listening on port", 3333
+    port = config.int('daemon.port', 3333)
+    httpd = ThreadingServer(("", port), RequestHandler)
+    print("httpd listening on port", port, file=log.v3)
     try:
       from jsonrpclib.SimpleJSONRPCServer import SimpleJSONRPCServer # https://pypi.python.org/pypi/jsonrpclib/0.1.6
     except Exception:
@@ -689,11 +708,14 @@ class Engine:
     else:
       from thread import start_new_thread
       start_new_thread(httpd.serve_forever, ())
-      server = SimpleJSONRPCServer(('localhost', 3334))
+      server = SimpleJSONRPCServer(('0.0.0.0', port+1))
       server.register_function(_classify, 'classify')
       server.register_function(_result, 'result')
-      print >> log.v3, "json-rpc listening on port", 3334
+      server.register_function(_backprob, 'backprob')
+      print("json-rpc listening on port", port+1, file=log.v3)
       server.serve_forever()
+
+###################################################################################
 
   def classify(self, data, output_file):
     out = open(output_file, 'w')
@@ -701,10 +723,17 @@ class Engine:
                                     batch_size=data.num_timesteps, max_seqs=1)
     forwarder = ClassificationTaskThread(self.network, self.devices, data, batches)
     forwarder.join()
-    print >> out, forwarder.output
+    print(forwarder.output, file=out)
     out.close()
 
-  def analyze(self, device, data, statistics):
+  def analyze(self, data, statistics):
+    """
+    :param Dataset.Dataset data:
+    :param list[str]|None statistics:
+    :return: nothing, will print everything to log.v1
+    """
+    if statistics is None:
+      statistics = ["confusion_matrix"]
     num_labels = len(data.labels)
     if "mle" in statistics:
       mle_labels = list(OrderedDict.fromkeys([ label.split('_')[0] for label in data.labels ]))
@@ -735,14 +764,14 @@ class Engine:
             confusion_matrix[real_c[i], max_c[i]] += 1
       num_batches += len(alloc_devices)
     if "confusion_matrix" in statistics:
-      print >> log.v1, "confusion matrix:"
+      print("confusion matrix:", file=log.v1)
       for i in range(confusion_matrix.shape[0]):
         for j in range(confusion_matrix.shape[1]):
-          print >> log.v1, str(confusion_matrix[i,j]).rjust(3),
-        print >> log.v1, ''
+          print(str(confusion_matrix[i,j]).rjust(3), end=' ', file=log.v1)
+        print('', file=log.v1)
     if "confusion_list" in statistics:
       n = 30
-      print >> log.v1, "confusion top" + str(n) + ":"
+      print("confusion top" + str(n) + ":", file=log.v1)
       top = []
       for i in range(confusion_matrix.shape[0]):
         for j in range(confusion_matrix.shape[1]):
@@ -753,9 +782,9 @@ class Engine:
               top.append([data.labels[i] + " -> " + data.labels[j], confusion_matrix[i,j]])
       top.sort(key = lambda x: x[1], reverse = True)
       for i in range(n):
-        print >> log.v1, top[i][0], top[i][1], str(100 * top[i][1] / float(data.num_timesteps)) + "%"
+        print(top[i][0], top[i][1], str(100 * top[i][1] / float(data.num_timesteps)) + "%", file=log.v1)
     if "error" in statistics:
-      print >> log.v1, "error:", 1.0 - sum([confusion_matrix[i,i] for i in range(confusion_matrix.shape[0])]) / float(data.num_timesteps)
+      print("error:", 1.0 - sum([confusion_matrix[i,i] for i in range(confusion_matrix.shape[0])]) / float(data.num_timesteps), file=log.v1)
 
   def compute_priors(self, dataset, config):
     from Dataset import Dataset
@@ -864,7 +893,7 @@ class SeqTrainParallelControl:
     # Forward the batches.
     from EngineUtil import assign_dev_data
     for batch in forward_batches:
-      print >> log.v4, "SeqTrainParallelControl, forward %r" % batch
+      print("SeqTrainParallelControl, forward %r" % batch, file=log.v4)
       success = assign_dev_data(self.train_device, dataset, [batch], load_seqs=False)
       assert success, "failed to allocate & assign data"
       self.train_device.update_data()
@@ -885,7 +914,7 @@ class SeqTrainParallelControl:
     for batch in batches:
       start_seq = min(start_seq, batch.start_seq)
       end_seq = max(end_seq, batch.end_seq)
-    print >>log.v5, "SeqTrainParallelControl, train_wait_for_seqs start_seq:%i, end_seq:%i" % (start_seq, end_seq)
+    print("SeqTrainParallelControl, train_wait_for_seqs start_seq:%i, end_seq:%i" % (start_seq, end_seq), file=log.v5)
     assert start_seq < end_seq
     assert start_seq >= self.train_start_seq, "non monotonic seq idx increase"
     while device.wait_for_result_call:

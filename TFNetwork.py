@@ -25,6 +25,9 @@ class ExternData(object):
     if data:
       self.register_data_from_dict(data)
 
+  def __repr__(self):
+    return "<ExternData data=%r>" % self.data
+
   def init_from_config(self, config):
     """
     :param Config.Config config:
@@ -39,6 +42,37 @@ class ExternData(object):
       self.data[key] = Data(name=key, auto_create_placeholders=True, **init_args)
     self.default_target = config.value('target', 'classes')
 
+  def init_from_dataset(self, dataset):
+    """
+    :param Dataset.Dataset dataset:
+    """
+    target_keys = list(dataset.get_target_list())
+    if target_keys:
+      if "classes" in target_keys:
+        self.default_target = "classes"
+      else:
+        self.default_target = target_keys[0]
+    data_keys = list(dataset.get_data_keys())
+    input_keys = [key for key in data_keys if key not in target_keys]
+    if input_keys:
+      if "data" in input_keys:
+        self.default_input = "data"
+      else:
+        self.default_input = input_keys[0]
+    for key in data_keys:
+      if key in dataset.get_target_list():
+        available_for_inference = False
+      else:
+        available_for_inference = True
+      dim = dataset.get_data_dim(key)
+      shape = [None] + list(dataset.get_data_shape(key))
+      sparse = dataset.is_data_sparse(key)
+      dtype = dataset.get_data_dtype(key)
+      self.data[key] = Data(
+        name=key, auto_create_placeholders=True, batch_dim_axis=0, time_dim_axis=1,
+        shape=shape, dim=dim, sparse=sparse, dtype=dtype,
+        available_for_inference=available_for_inference)
+
   def register_data_from_dict(self, data):
     """
     :param dict[str,dict[str]] data: init kwargs for Data
@@ -48,7 +82,7 @@ class ExternData(object):
 
   def register_data(self, data):
     """
-    :param ExternData.Data data:
+    :param Data data: will use data.name as the key
     """
     assert data.name not in self.data
     self.data[data.name] = data
@@ -83,21 +117,33 @@ class ExternData(object):
     dtypes = [self.data[name].dtype for name in names]
     # And add seq_lens for each.
     for name in list(names):
-      names.append("%s_seq_lens" % name)
-      shapes.append((fixed_batch_dim,) if with_batch_dim else ())
-      dtypes.append(self.data[name].size_dtype)
+      for axis in self.data[name].get_axes_with_size():
+        names.append("%s/size%i" % (name, axis))
+        shapes.append((fixed_batch_dim,) if with_batch_dim else ())
+        dtypes.append(self.data[name].size_dtype)
     return {"names": names, "shapes": shapes, "dtypes": dtypes}
 
 
 class TFNetwork(object):
-  def __init__(self, config=None, extern_data=None, rnd_seed=42, train_flag=False, eval_flag=False):
+  def __init__(self, config=None, extern_data=None, rnd_seed=42,
+               train_flag=False, eval_flag=False, search_flag=False,
+               parent_layer=None, parent_net=None,
+               name=None):
     """
-    :param Config.Config config: only needed to init extern_data if not specified explicitely
+    :param Config.Config config: only needed to init extern_data if not specified explicitly
     :param ExternData|None extern_data:
     :param int rnd_seed:
-    :param bool train_flag: True if we want to use this model in training
-    :param bool eval_flag: True if we want to use this model in evaluation
+    :param bool|tf.Tensor train_flag: True if we want to use this model in training, False if in eval, or dynamic
+    :param bool eval_flag: whether to calculate losses. if train_flag is not False, this will be set to True
+    :param bool search_flag: whether we perform a beam-search. see usage
+    :param TFNetworkLayer.LayerBase|None parent_layer:
+    :param TFNetwork parent_net:
+    :param str name: only for debugging
     """
+    if not name:
+      from Util import try_get_caller_name
+      name = "<network via %s>" % try_get_caller_name(fallback="<unknown>")
+    self.name = name
     if extern_data is None:
       extern_data = ExternData()
       if not config:
@@ -105,12 +151,23 @@ class TFNetwork(object):
         config = get_global_config()
       extern_data.init_from_config(config)
     self.extern_data = extern_data
+    self._config = config
     self.used_data_keys = set()
     self.rnd_seed = rnd_seed
     self.random = numpy.random.RandomState(rnd_seed)
+    assert isinstance(train_flag, (bool, tf.Tensor))
     self.train_flag = train_flag
+    assert isinstance(eval_flag, bool)
+    if train_flag is not False:  # True or dynamic
+      eval_flag = True
     self.eval_flag = eval_flag
+    self.search_flag = search_flag
+    self.parent_layer = parent_layer
+    if not parent_net and parent_layer:
+      parent_net = parent_layer.network
+    self.parent_net = parent_net
     self._selected_train_layers = None
+    self._constructing_layers = []  # type: list[str]
     self.layers_desc = {}  # type: dict[str,dict[str]]
     self.layers = {}  # type: dict[str,LayerBase]
     self.loss_by_layer = {}  # type: dict[str,tf.Tensor]
@@ -118,11 +175,37 @@ class TFNetwork(object):
     self.total_loss = None  # type: tf.Tensor
     self.total_constraints = None  # type: tf.Tensor
     self.total_objective = None  # type: tf.Tensor
-    self.global_train_step = tf.Variable(
-      name="global_step", initial_value=0, dtype="int64", collections=[tf.GraphKeys.GLOBAL_STEP], trainable=False)
+    if parent_net:
+      self.global_train_step = parent_net.global_train_step
+    else:
+      self.global_train_step = tf.Variable(
+        name="global_step", initial_value=0, dtype="int64", collections=[tf.GraphKeys.GLOBAL_STEP], trainable=False)
     self.saver = None  # type: tf.train.Saver
+    self.extra_vars_to_save = []  # type: list[tf.Variable]
     self.recurrent = False
     self._assigner_cache = {}  # type: dict[tf.Variable,VariableAssigner]
+    self.concat_sources_dropout_cache = {}  # type: dict[(tuple[LayerBase],float),Data]
+
+  def __repr__(self):
+    s = "TFNetwork %r" % self.name
+    if self.parent_layer:
+      s += " parent_layer=%r" % self.parent_layer
+    elif self.parent_net:
+      s += " parent_net=%r" % self.parent_net
+    if self.train_flag is True:
+      s += " train"
+    elif self.train_flag is not None:
+      s += " train=%r" % self.train_flag
+    if self.search_flag is True:
+      s += " search"
+    return "<%s>" % s
+
+  def get_absolute_name_scope_prefix(self):
+    if self.parent_layer:
+      return self.parent_layer.get_absolute_name_scope_prefix()
+    if self.parent_net:
+      return self.parent_net.get_absolute_name_scope_prefix()
+    return ""
 
   def construct_from(self, list_or_dict):
     """
@@ -158,48 +241,86 @@ class TFNetwork(object):
     """
     :param dict[str,dict[str]] net_dict:
     """
-    def _construct_layer(name):
-      """
-      :param str name:
-      :param dict[str] layer_desc:
-      """
-      if name in self.layers:
-        return self.layers[name]
-      if name not in net_dict:
-        if name == "data":
-          layer_desc = {"class": "source", "from": []}
-        elif name.startswith("data:"):
-          layer_desc = {"class": "source", "data_key": name[len("data:"):], "from": []}
-        else:
-          raise Exception("layer not found: %r" % name)
-      else:
-        layer_desc = net_dict[name]
-      self.layers_desc[name] = layer_desc
-      layer_desc = layer_desc.copy()
-      class_name = layer_desc.pop("class")
-      layer_class = get_layer_class(class_name)
-      src_names = layer_desc.pop("from", ["data"])
-      if not isinstance(src_names, (list, tuple)):
-        src_names = [src_names]
-      layer_desc["sources"] = [
-        _construct_layer(src_name)
-        for src_name in src_names
-        if not src_name == "none"]
-      return self._add_layer(name=name, layer_class=layer_class, **layer_desc)
-
     for name, layer_desc in sorted(net_dict.items()):
-      if name == "output" or "target" in layer_desc or "is_output_layer" in layer_desc:
-        _construct_layer(name)
+      assert isinstance(name, str)
+      assert isinstance(layer_desc, dict)
+      if name == "output" or "target" in layer_desc or "loss" in layer_desc or layer_desc.get("is_output_layer", False):
+        self._construct_layer(net_dict, name)
+    assert not self._constructing_layers
 
-  def _add_layer(self, name, layer_class, **layer_desc):
+  def _construct_layer(self, net_dict, name, get_layer=None, add_layer=None):
+    """
+    :param dict[str,dict[str]] net_dict:
+    :param str name: layer name
+    :param ((str) -> LayerBase)|None get_layer: optional, for source layers, for transform_config_dict
+    :param ((str, LayerBase, dict) -> LayerBase) | None add_layer: self.add_layer
+    :rtype: LayerBase
+    """
+    if name in self.layers:
+      return self.layers[name]
+    if name in self._constructing_layers:
+      print("Error: There is a dependency loop on layer %r." % name, file=log.v1)
+      print("Construction stack (most recent first):", file=log.v1)
+      for l in reversed(self._constructing_layers):
+        print("  %s" % l)
+      raise Exception("Dependency loop on layer %r." % name)
+    self._constructing_layers.append(name)
+    if name not in net_dict:
+      if name == "data":
+        layer_desc = {"class": "source", "from": []}
+      elif name.startswith("data:"):
+        layer_desc = {"class": "source", "data_key": name[len("data:"):], "from": []}
+      else:
+        raise Exception("layer not found: %r" % name)
+    else:
+      layer_desc = net_dict[name]
+    if not get_layer:
+      def get_layer(src_name):
+        return self._construct_layer(net_dict=net_dict, name=src_name)
+    if not add_layer:
+      add_layer = self.add_layer
+    self.layers_desc[name] = layer_desc
+    layer_desc = layer_desc.copy()
+    class_name = layer_desc.pop("class")
+    layer_class = get_layer_class(class_name)
+    layer_class.transform_config_dict(layer_desc, network=self, get_layer=get_layer)
+    self._constructing_layers.remove(name)
+    return add_layer(name=name, layer_class=layer_class, **layer_desc)
+
+  def add_layer(self, name, layer_class, **layer_desc):
     """
     :param str name:
-    :param ()->LayerBase layer_class:
+    :param (()->LayerBase)|LayerBase layer_class:
     """
+    from Util import help_on_type_error_wrong_args
+    layer_desc = layer_desc.copy()
+    assert "name" not in layer_desc
+    assert "network" not in layer_desc
+    assert "output" not in layer_desc
+    layer_desc["name"] = name
+    layer_desc["network"] = self
+    debug_print_layer_output_template = self._config and self._config.bool("debug_print_layer_output_template", False)
+    debug_print_layer_output_sizes = self._config and self._config.bool("debug_print_layer_output_sizes", False)
+    debug_print_layer_output_shape = self._config and self._config.bool("debug_print_layer_output_shape", False)
     with reuse_name_scope(layer_class.cls_get_tf_scope_name(name)):
-      layer = layer_class(name=name, network=self, **layer_desc)
+      try:
+        output = layer_class.get_out_data_from_opts(**layer_desc)
+        if debug_print_layer_output_template:
+          print("layer %r output: %r" % (name, output))
+        layer = layer_class(output=output, **layer_desc)
+      except TypeError:
+        help_on_type_error_wrong_args(cls=layer_class, kwargs=list(layer_desc.keys()))
+        raise
+      layer.post_init()
+      if debug_print_layer_output_sizes:
+        print("layer %r output sizes: %r" % (name, output.size_placeholder))
+      if debug_print_layer_output_shape:
+        layer.output.placeholder = tf.Print(
+          layer.output.placeholder, [layer_class.cls_get_tf_scope_name(name), "shape:", tf.shape(layer.output.placeholder)],
+          summarize=10, name="debug_print_layer_output_shape")
     assert layer.output
     assert layer.output.placeholder is not None
+    layer.output.placeholder.set_shape(layer.output.batch_shape)
     assert layer.output.size_placeholder is not None
     self.layers[name] = layer
     if layer.recurrent:
@@ -215,7 +336,19 @@ class TFNetwork(object):
     """
     if mark_data_key_as_used:
       self.used_data_keys.add(key)
+    if key == "seq_idx" and key not in self.extern_data.data:
+      self.extern_data.data[key] = Data(name="seq_idx", shape=(), dtype="int32", sparse=False, auto_create_placeholders=True)
+    if key == "seq_tag" and key not in self.extern_data.data:
+      self.extern_data.data[key] = Data(name="seq_tag", shape=(), dtype="string", auto_create_placeholders=True)
     return self.extern_data.get_data(key)
+
+  def get_seq_tags(self, mark_data_key_as_used=True):
+    """
+    :param bool mark_data_key_as_used: for extern_data
+    :return: tensor of shape (batch,) of dtype string, via extern_data
+    :rtype: tf.Tensor
+    """
+    return self.get_extern_data(key="seq_tag", mark_data_key_as_used=mark_data_key_as_used).placeholder
 
   def construct_objective(self):
     with tf.name_scope("objective"):
@@ -225,40 +358,72 @@ class TFNetwork(object):
       self.error_by_layer.clear()
       for name, layer in sorted(self.layers.items()):
         assert isinstance(layer, LayerBase)
-        with reuse_name_scope(layer.tf_scope_name):
-          loss = layer.get_loss_value()
-          error = layer.get_error_value()
-          constraints = layer.get_constraints_value()
+        with reuse_name_scope("loss"):
+          with reuse_name_scope(layer.tf_scope_name):
+            loss = layer.get_loss_value()
+            error = layer.get_error_value()
+            if loss is not None:
+              tf.summary.scalar("loss_%s" % layer.name, loss * layer.get_loss_normalization_factor())
+            if error is not None:
+              tf.summary.scalar("error_%s" % layer.name, error * layer.get_loss_normalization_factor())
+        with reuse_name_scope("constraints"):
+          with reuse_name_scope(layer.tf_scope_name):
+            constraints = layer.get_constraints_value()
+
+        with reuse_name_scope("loss"):
           if loss is not None:
-            tf.summary.scalar("loss_%s" % layer.name, loss)
+            self.loss_by_layer[name] = loss
+            if layer.loss_scale != 1:
+              loss *= layer.loss_scale
+            if self.total_loss is 0:
+              self.total_loss = loss
+            else:
+              self.total_loss += loss
           if error is not None:
-            tf.summary.scalar("error_%s" % layer.name, error)
-        if loss is not None:
-          self.loss_by_layer[name] = loss
-          self.total_loss += loss
-        if error is not None:
-          self.error_by_layer[name] = error
-        if constraints is not None:
-          self.total_constraints += constraints
+            self.error_by_layer[name] = error
+        with reuse_name_scope("constraints"):
+          if constraints is not None:
+            if self.total_constraints is 0:
+              self.total_constraints = constraints
+            else:
+              self.total_constraints += constraints
+
       tf.summary.scalar("loss", self.total_loss)
       tf.summary.scalar("constraints", self.total_constraints)
       self.total_objective = self.total_loss + self.total_constraints
       tf.summary.scalar("objective", self.total_objective)
 
-  def get_all_losses(self):
+  def maybe_construct_objective(self):
     if self.total_objective is None:
       self.construct_objective()
+
+  def get_all_losses(self):
+    self.maybe_construct_objective()
     return self.loss_by_layer
 
   def get_all_errors(self):
-    if self.total_objective is None:
-      self.construct_objective()
+    """
+    :rtype: dict[str|tf.Tensor]
+    :return: layer-name -> error dict. contains only the layers which have some error value
+    """
+    self.maybe_construct_objective()
     return self.error_by_layer
 
   def get_objective(self):
-    if self.total_objective is None:
-      self.construct_objective()
+    self.maybe_construct_objective()
     return self.total_objective
+
+  def get_total_loss(self):
+    """
+    :rtype: int|tf.Tensor
+    :return: 0 if no loss, or tf.Tensor
+    """
+    self.maybe_construct_objective()
+    return self.total_loss
+
+  def get_total_constraints(self):
+    self.maybe_construct_objective()
+    return self.total_constraints
 
   def get_used_targets(self):
     """
@@ -305,6 +470,18 @@ class TFNetwork(object):
       return output_layers[1]
     return None  # no sensible default
 
+  def get_default_output_layer(self, must_exist=True):
+    """
+    :param bool must_exist: if it does not exist, will raise an exception
+    :rtype: LayerBase|None
+    :return: the default output layer
+    """
+    name = self.get_default_output_layer_name()
+    if not name:
+      assert not must_exist, "default output layer does not exist"
+      return None
+    return self.layers[name]
+
   def get_params_list(self):
     """
     :return: list of model variables, i.e. from all the layers, excluding auxiliary vars like global_step
@@ -316,6 +493,20 @@ class TFNetwork(object):
       for param_name, param in sorted(layer.params.items()):
         assert isinstance(param, tf.Variable)
         l.append(param)
+    return l
+
+  def get_saveable_params_list(self):
+    """
+    :return: list of model variables or SaveableObject, to save/restore
+    :rtype: list[tf.Variable|tensorflow.python.training.saver.BaseSaverBuilder.SaveableObject]
+    """
+    l = []  # type: list[tf.Variable]
+    for layer_name, layer in sorted(self.layers.items()):
+      assert isinstance(layer, LayerBase)
+      for param_name, param in sorted(layer.get_saveable_params_dict().items()):
+        l.append(param)
+    l += self.get_auxiliary_params()
+    l += self.extra_vars_to_save
     return l
 
   def get_params_nested_dict(self):
@@ -336,13 +527,19 @@ class TFNetwork(object):
     """
     if not self._selected_train_layers:
       self.declare_train_params()
+    trainable_vars_col = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+    assert isinstance(trainable_vars_col, list)
     l = []  # type: list[tf.Variable]
     for layer_name in sorted(self._selected_train_layers):
       layer = self.layers[layer_name]
       assert isinstance(layer, LayerBase)
+      if not layer.trainable:
+        continue
       for param_name, param in sorted(layer.params.items()):
         assert isinstance(param, tf.Variable)
-        l.append(param)
+        if param in trainable_vars_col:
+          l.append(param)
+          trainable_vars_col.remove(param)
     return l
 
   def declare_train_params(self, hidden_layer_selection=None, with_output=None):
@@ -449,15 +646,19 @@ class TFNetwork(object):
     """
     return self.global_train_step.eval(session=session)
 
+  def reset_saver(self):
+    """
+    Resets the :class:`tf.train.Saver` object which will be used
+    for :func:`load_params_from_file` and :func:`save_params_to_file`.
+    Warning: Don't repeat that too often as it will always create new ops in the computation graph.
+    """
+    self.saver = None
+
   def _create_saver(self):
     # Saver for storing checkpoints of the model.
-    # If we want to check for existence of variables in the checkpoint:
-    # http://stackoverflow.com/questions/38218174/how-can-find-the-variable-names-that-saved-in-tensorflow-checkpoint
-    # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/framework/python/framework/checkpoint_utils.py
-    # http://stackoverflow.com/questions/38944238/tensorflow-list-variables-in-the-checkpoint
     with tf.name_scope("saver"):
       self.saver = tf.train.Saver(
-        var_list=self.get_params_list() + self.get_auxiliary_params(), max_to_keep=2 ** 31 - 1)
+        var_list=self.get_saveable_params_list(), max_to_keep=2 ** 31 - 1)
 
   def save_params_to_file(self, filename, session):
     """
@@ -493,7 +694,116 @@ class TFNetwork(object):
     """
     if not self.saver:
       self._create_saver()
-    self.saver.restore(sess=session, save_path=filename)
+    # Note:
+    # If we want to check for existence of variables in the checkpoint:
+    # http://stackoverflow.com/questions/38218174/how-can-find-the-variable-names-that-saved-in-tensorflow-checkpoint
+    # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/framework/python/framework/checkpoint_utils.py
+    # http://stackoverflow.com/questions/38944238/tensorflow-list-variables-in-the-checkpoint
+    try:
+      self.saver.restore(sess=session, save_path=filename)
+    except tf.errors.NotFoundError as exc:
+      print("load_params_from_file: some variables not found", file=log.v2)
+      # First, the short version, we will try to automatically resolve this, similar to this:
+      # https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/rnn/python/tools/checkpoint_convert.py
+      # Also see:
+      # https://github.com/tensorflow/tensorflow/issues/11168
+      # https://github.com/tensorflow/tensorflow/commit/92da8abfd35b93488ed7a55308b8f589ee23b622
+      # https://github.com/tensorflow/tensorflow/commit/157370e5916b85c65958ed8383ae31d727228ed7
+      # This map_list can be extended by all the mappings in checkpoint_convert.py.
+      map_list = {"lstm_cell/biases": "lstm_cell/bias", "lstm_cell/weights": "lstm_cell/kernel"}
+      reader = tf.train.NewCheckpointReader(filename)
+      net_vars = [v for v in self.get_saveable_params_list() if isinstance(v, tf.Variable)]
+      net_saveables = [v for v in self.get_saveable_params_list() if not isinstance(v, tf.Variable)]
+      var_ckpt_names = set(reader.get_variable_to_shape_map())
+      var_net_names = set([v.name[:-2] for v in net_vars] + [v.name for v in net_saveables])
+      missing_var_names = [v for v in sorted(var_net_names) if v not in var_ckpt_names]
+      obsolete_var_names = [v for v in sorted(var_ckpt_names) if v not in var_net_names]
+      print("Variables to restore which are not in checkpoint:", missing_var_names, file=log.v2)
+      if not missing_var_names:
+        print("Strange, nothing missing?", file=log.v2)
+        print("Original exception:", exc, file=log.v2)
+
+      var_name_map = {}  # type: dict[str,()->numpy.ndarray]  # current name -> value-loader
+
+      def make_load_renamed(old_name):
+        def load_old():
+          return reader.get_tensor(old_name)
+        return load_old
+
+      class make_load_cudnn_rnn:
+        cudnn_postfix = "/cudnn/CudnnRNNParamsToCanonical:0"
+
+        def __init__(self, prefix, target="lstm_block_wrapper/"):
+          self.target = target
+          self.keys = [target + "bias", target + "kernel"]
+          self.prefix = prefix
+          self.data = None
+
+        def _load(self):
+          from TFNetworkRecLayer import RecLayer
+          self.data = RecLayer.convert_cudnn_canonical_to_lstm_block(
+            reader=reader, prefix=self.prefix, target=self.target)
+
+        def make_getter(self, key):
+          def get():
+            if self.data is None:
+              self._load()
+            return self.data[key]
+          return get
+
+        def get_lazy_dict(self):
+          return {self.prefix + k: self.make_getter(self.prefix + k) for k in self.keys}
+
+      for v in obsolete_var_names:
+        for k_old, k_new in map_list.items():
+          if v.endswith("/%s" % k_old):
+            v2 = v[:-len(k_old)] + k_new
+            if v2 in missing_var_names:
+              var_name_map[v2] = make_load_renamed(old_name=v)
+              break
+        if v.endswith(make_load_cudnn_rnn.cudnn_postfix):
+          var_name_map.update(
+            make_load_cudnn_rnn(prefix=v[:-len(make_load_cudnn_rnn.cudnn_postfix) + 1]).get_lazy_dict())
+
+      could_not_find_map_list = [v for v in missing_var_names if v not in var_name_map]
+      if not could_not_find_map_list:
+        # We can restore all.
+        print("We found these corresponding variables in the checkpoint:", var_name_map, file=log.v2)
+        print("Loading now...", file=log.v3)
+        # Similar: from tensorflow.contrib.framework.python.ops import assign_from_checkpoint
+        for v in self.get_saveable_params_list():
+          assert isinstance(v, tf.Variable), "not yet implemented otherwise..."
+          v_name = v.name[:-2]  # current name
+          if v_name in var_ckpt_names:
+            value = reader.get_tensor(v_name)
+          else:
+            value = var_name_map[v_name]()
+          assigner = self.get_var_assigner(v)
+          assigner.assign(value=value, session=session)
+        print("Successfully loaded all variables. Any new save will use the updated variable names.", file=log.v3)
+
+      else:
+        print("Could not find mappings for these variables:", could_not_find_map_list, "var_name_map:", var_name_map)
+        print("Error, some entry is missing in the checkpoint %r: %s: %s" % (filename, type(exc), exc), file=log.v1)
+        print("All variables in checkpoint:")
+        print(reader.debug_string())
+        print("All variables to restore:")
+        for v in net_vars + net_saveables:
+          print(v)
+        print()
+        print("Variables to restore which are not in checkpoint:")
+        for v in sorted(var_net_names):
+          if v in var_ckpt_names:
+            continue
+          print(v)
+        print()
+        print("Variables in checkpoint which are not needed for restore:")
+        for v in sorted(var_ckpt_names):
+          if v in var_net_names:
+            continue
+          print(v)
+        print()
+        raise exc
 
   def print_network_info(self, name="Network"):
     print("%s layer topology:" % name, file=log.v2)
@@ -505,6 +815,84 @@ class TFNetwork(object):
       print("  (no layers)", file=log.v2)
     print("net params #:", self.get_num_params(), file=log.v2)
     print("net trainable params:", self.get_trainable_params(), file=log.v2)
+
+  def cond_on_train(self, fn_train, fn_eval):
+    """
+    Uses fn_train() or fn_eval() base on self.train_flag.
+    It will be a branched evaluation.
+
+    :param ()->tf.Tensor fn_train:
+    :param ()->tf.Tensor fn_eval:
+    :return: fn_train() if self.train_flag else fn_eval()
+    :rtype: tf.Tensor
+    """
+    from TFUtil import cond
+    return cond(self.train_flag, fn_train, fn_eval)
+
+  def get_search_choices(self, sources=None, src=None, _visited=None):
+    """
+    Recursively searches through all sources,
+    and if there is a ChoiceLayer, returns it.
+    Could also go to the parent network.
+
+    :param LayerBase|None src:
+    :param list[LayerBase]|None sources:
+    :param set[LayerBase]|None _visited: keep track about visited layers in case there are circular deps
+    :return: (direct or indirect) source LayerBase which has search_choices, or None
+    :rtype: LayerBase|None
+    """
+    assert sources is None or src is None, "don't provide both"
+    if src is not None:
+      assert isinstance(src, LayerBase)
+      if src.search_choices:
+        if src.search_choices.is_decided:
+          return None
+        return src
+      sources = src.get_dep_layers()
+    if _visited is None:
+      _visited = set()
+    assert sources is not None
+    sources = [src for src in sources if src not in _visited]
+    _visited.update(sources)
+    layers = [self.get_search_choices(src=src, _visited=_visited) for src in sources]
+    layers = [layer for layer in layers if layer is not None]  # type: list[LayerBase]
+    layers = set(layers)
+    assert len(layers) <= 1, "multiple choice layers not supported yet"
+    if len(layers) == 1:
+      return list(layers)[0]
+    if self.parent_layer:
+      return self.parent_layer.network.get_search_choices(sources=self.parent_layer.get_dep_layers())
+    return None
+
+  def get_batch_dim(self):
+    """
+    Get the batch-dim size, i.e. amount of sequences in the current batch.
+    Consider that the data tensor is usually of shape [batch, time, dim],
+    this would return shape(data)[0].
+
+    The code currently assumes that the batch-dim can be taken from the extern data.
+    If it does not have that available for some reason (e.g. some subnetwork),
+    it will try some alternative sources and assumes that they have the correct batch-dim.
+
+    Note that the batch-dim usually stays always the same across the whole network
+    and also every individual batch sequence will stay related.
+    One notable exception of this is the choice layer, where the
+    batch-dim will get expanded by the beam search if search is used,
+    as well as in all following layers, until there is a decide layer.
+
+    :return: int scalar tensor which states the batch-dim
+    :rtype: int|tf.Tensor
+    """
+    from TFUtil import get_shape_dim
+    # First check parent because there we might get the true batch dim.
+    if self.parent_net:
+      return self.parent_net.get_batch_dim()
+    for key, data in sorted(self.extern_data.data.items()):
+      assert isinstance(data, Data)
+      if data.available_for_inference:
+        self.used_data_keys.add(key)
+        return get_shape_dim(data.placeholder, data.batch_dim_axis, name="batch_dim")
+    raise Exception("We cannot tell the batch dim.")
 
 
 class TFNetworkParamsSerialized(object):

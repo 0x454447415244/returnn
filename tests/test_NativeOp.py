@@ -1,16 +1,23 @@
 
+from __future__ import print_function
+
+import sys
+sys.path += ["."]  # Python 3 hack
+
 
 import sys
 import numpy
 import theano
 import theano.tensor as T
 import theano.scan_module.scan_op
+import unittest
 from nose.tools import assert_equal, assert_is, assert_is_instance
+from numpy.testing.utils import assert_almost_equal, assert_allclose
 import theano.printing
 from pprint import pprint
 from GeneratingDataset import Task12AXDataset
 from Updater import Updater
-from Device import Device
+from Device import Device, have_gpu
 from Util import NumbersDict
 from Config import Config
 from NetworkHiddenLayer import DumpLayer
@@ -154,35 +161,35 @@ def compare_lstm(lstm_opts=None):
   res1 = load()
   res2 = load(lstm_opts=lstm_opts)
   fail = False
-  print "keys in res1:", sorted(res1.keys())
-  print "keys in res2:", sorted(res2.keys())
+  print("keys in res1:", sorted(res1.keys()))
+  print("keys in res2:", sorted(res2.keys()))
   for key in sorted(res1.keys()):
     if key not in res2:
-      print "ERROR: %r not in res2" % key
+      print("ERROR: %r not in res2" % key)
       fail = True
     v1 = res1[key]
     v2 = res2[key]
     v1 = numpy.asarray(v1)
     v2 = numpy.asarray(v2)
     if v1.shape != v2.shape:
-      print "shape does not match for %r" % key
-      print "v1 shape:", v1.shape
-      print "v2 shape:", v2.shape
+      print("shape does not match for %r" % key)
+      print("v1 shape:", v1.shape)
+      print("v2 shape:", v2.shape)
       fail = True
     elif not numpy.allclose(v1, v2, atol=atol):
-      print "not equal: %r" % key
+      print("not equal: %r" % key)
       c = 0
       for idx in zip(*numpy.unravel_index(range(numpy.prod(v1.shape)), v1.shape)):
         e1 = v1[idx]
         e2 = v2[idx]
         if not numpy.isclose(e1, e2, atol=atol):
-          print "idx %r differs: %r vs %r" % (idx, e1, e2)
+          print("idx %r differs: %r vs %r" % (idx, e1, e2))
           c += 1
           if c >= 10: break
       fail = True
   for key in sorted(res2.keys()):
     if key not in res1:
-      print "ERROR: %r not in res1" % key
+      print("ERROR: %r not in res1" % key)
       fail = True
   assert not fail
 
@@ -190,4 +197,143 @@ def compare_lstm(lstm_opts=None):
 def test_native_lstm():
   compare_lstm({"class": "native_lstm"})
 
+
+@unittest.skipIf(not have_gpu(), "no gpu on this system")
+def test_fast_bw():
+  print("Make op...")
+  from NativeOp import FastBaumWelchOp
+  op = FastBaumWelchOp().make_op()  # (am_scores, edges, weights, start_end_states, float_idx, state_buffer)
+  print("Op:", op)
+  n_batch = 3
+  seq_len = 5
+  n_classes = 5
+  from Fsa import FastBwFsaShared
+  fsa = FastBwFsaShared()
+  fsa.add_inf_loop(state_idx=0, num_emission_labels=n_classes)
+  fast_bw_fsa = fsa.get_fast_bw_fsa(n_batch=n_batch)
+  edges = fast_bw_fsa.edges.view("float32")
+  edges_placeholder = T.fmatrix(name="edges")
+  weights = fast_bw_fsa.weights
+  weights_placeholder = T.fvector(name="weights")
+  start_end_states = fast_bw_fsa.start_end_states.view("float32")
+  start_end_states_placeholder = T.fmatrix(name="start_end_states")
+  am_scores = numpy.random.normal(size=(seq_len, n_batch, n_classes)).astype("float32")  # in -log space
+  am_scores_placeholder = T.ftensor3(name="am_scores")
+  float_idx = numpy.ones((seq_len, n_batch), dtype="float32")
+  float_idx_placeholder = T.fmatrix(name="float_idx")
+  last_state_idx = numpy.max(fast_bw_fsa.start_end_states[1])  # see get_automata_for_batch
+  state_buffer = numpy.zeros((2, last_state_idx + 1), dtype="float32")
+  state_buffer_placeholder = T.fmatrix(name="state_buffer")
+  print("Construct call...")
+  fwdbwd, obs_scores = op(
+    am_scores_placeholder, edges_placeholder, weights_placeholder, start_end_states_placeholder, float_idx_placeholder, state_buffer_placeholder)
+  f = theano.function(inputs=[am_scores_placeholder, edges_placeholder, weights_placeholder, start_end_states_placeholder, float_idx_placeholder, state_buffer_placeholder], outputs=[fwdbwd, obs_scores])
+  print("Done.")
+  print("Eval:")
+  _, score = f(am_scores, edges, weights, start_end_states, float_idx, state_buffer)
+  print("score:", score)
+
+
+@unittest.skipIf(not have_gpu(), "no gpu on this system")
+def test_fast_bw_uniform():
+  print("Make op...")
+  from NativeOp import FastBaumWelchOp
+  op = FastBaumWelchOp().make_op()  # (am_scores, edges, weights, start_end_states, float_idx, state_buffer)
+  print("Op:", op)
+  n_batch = 3
+  seq_len = 7
+  n_classes = 5
+  from Fsa import FastBwFsaShared
+  fsa = FastBwFsaShared()
+  for i in range(n_classes):
+    fsa.add_edge(i, i + 1, emission_idx=i)  # fwd
+    fsa.add_edge(i + 1, i + 1, emission_idx=i)  # loop
+  assert n_classes <= seq_len
+  fast_bw_fsa = fsa.get_fast_bw_fsa(n_batch=n_batch)
+  print("edges:")
+  print(fast_bw_fsa.edges)
+  edges = fast_bw_fsa.edges.view("float32")
+  edges_placeholder = T.fmatrix(name="edges")
+  weights = fast_bw_fsa.weights
+  weights_placeholder = T.fvector(name="weights")
+  print("start_end_states:")
+  print(fast_bw_fsa.start_end_states)
+  start_end_states = fast_bw_fsa.start_end_states.view("float32")
+  start_end_states_placeholder = T.fmatrix(name="start_end_states")
+  am_scores = numpy.ones((seq_len, n_batch, n_classes), dtype="float32") * numpy.float32(1.0 / n_classes)
+  am_scores = -numpy.log(am_scores)  # in -log space
+  am_scores_placeholder = T.ftensor3(name="am_scores")
+  float_idx = numpy.ones((seq_len, n_batch), dtype="float32")
+  float_idx_placeholder = T.fmatrix(name="float_idx")
+  last_state_idx = numpy.max(fast_bw_fsa.start_end_states[1])  # see get_automata_for_batch
+  state_buffer = numpy.zeros((2, last_state_idx + 1), dtype="float32")
+  state_buffer_placeholder = T.fmatrix(name="state_buffer")
+  print("Construct call...")
+  fwdbwd, obs_scores = op(
+    am_scores_placeholder, edges_placeholder, weights_placeholder, start_end_states_placeholder, float_idx_placeholder, state_buffer_placeholder)
+  f = theano.function(inputs=[am_scores_placeholder, edges_placeholder, weights_placeholder, start_end_states_placeholder, float_idx_placeholder, state_buffer_placeholder], outputs=[fwdbwd, obs_scores])
+  print("Done.")
+  print("Eval:")
+  fwdbwd, score = f(am_scores, edges, weights, start_end_states, float_idx, state_buffer)
+  print("score:")
+  print(repr(score))
+  assert_equal(score.shape, (seq_len, n_batch))
+  bw = numpy.exp(-fwdbwd)
+  print("Baum-Welch soft alignment:")
+  print(repr(bw))
+  assert_equal(bw.shape, (seq_len, n_batch, n_classes))
+  from numpy import array, float32
+  if seq_len == n_classes:
+    print("Extra check identity...")
+    for i in range(n_batch):
+      assert_almost_equal(numpy.identity(n_classes), bw[:, i])
+  if seq_len == 7 and n_classes == 5:
+    print("Extra check ref_align (7,5)...")
+    assert_allclose(score, 8.55801582, rtol=1e-5)  # should be the same everywhere
+    ref_align = \
+      array([[[1., 0., 0., 0., 0.]],
+             [[0.33333316, 0.66666663, 0., 0., 0.]],
+             [[0.06666669, 0.53333354, 0.40000018, 0., 0.]],
+             [[0., 0.20000014, 0.60000014, 0.19999999, 0.]],
+             [[0., 0., 0.39999962, 0.53333312, 0.06666663]],
+             [[0., 0., 0., 0.66666633, 0.33333316]],
+             [[0., 0., 0., 0., 0.99999982]]], dtype=float32)
+    assert_equal(ref_align.shape, (seq_len, 1, n_classes))
+    ref_align = numpy.tile(ref_align, (1, n_batch, 1))
+    assert_equal(ref_align.shape, bw.shape)
+    # print("Reference alignment:")
+    # print(repr(ref_align))
+    print("mean square diff:", numpy.mean(numpy.square(ref_align - bw)))
+    print("max square diff:", numpy.max(numpy.square(ref_align - bw)))
+    assert_allclose(ref_align, bw, rtol=1e-5)
+  print("Done.")
+
+
+if __name__ == "__main__":
+  try:
+    better_exchook.install()
+    if len(sys.argv) <= 1:
+      for k, v in sorted(globals().items()):
+        if k.startswith("test_"):
+          print("-" * 40)
+          print("Executing: %s" % k)
+          try:
+            v()
+          except unittest.SkipTest as exc:
+            print("SkipTest:", exc)
+          print("-" * 40)
+      print("Finished all tests.")
+    else:
+      assert len(sys.argv) >= 2
+      for arg in sys.argv[1:]:
+        print("Executing: %s" % arg)
+        if arg in globals():
+          globals()[arg]()  # assume function and execute
+        else:
+          eval(arg)  # assume Python code and execute
+  finally:
+    import threading
+    #if len(list(threading.enumerate())) > 1:
+    #  print("Warning, more than one thread at exit:")
+    #  better_exchook.dump_all_thread_tracebacks()
 

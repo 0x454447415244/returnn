@@ -1,4 +1,6 @@
 
+from __future__ import print_function
+
 import subprocess
 from subprocess import CalledProcessError
 import h5py
@@ -10,6 +12,11 @@ import shlex
 import numpy as np
 import re
 import time
+try:
+  import thread
+except ImportError:
+  import _thread as thread
+import threading
 
 PY3 = sys.version_info[0] >= 3
 
@@ -87,7 +94,10 @@ def cmd(s):
   """
   p = subprocess.Popen(s, stdout=subprocess.PIPE, shell=True, close_fds=True,
                        env=dict(os.environ, LANG="en_US.UTF-8", LC_ALL="en_US.UTF-8"))
-  result = [ tag.strip() for tag in p.communicate()[0].split('\n')[:-1]]
+  stdout = p.communicate()[0]
+  if PY3:
+    stdout = stdout.decode("utf8")
+  result = [tag.strip() for tag in stdout.split('\n')[:-1]]
   p.stdout.close()
   if p.returncode != 0:
     raise CalledProcessError(p.returncode, s, "\n".join(result))
@@ -168,13 +178,8 @@ def describe_tensorflow_version():
     tdir = os.path.dirname(tf.__file__)
   except Exception as e:
     tdir = "<unknown(exception: %r)>" % e
-  try:
-    version = tf.__git_version__
-  except Exception:
-    try:
-      version = tf.__version__
-    except Exception as e:
-      version = "<unknown(exception: %r)>" % e
+  version = getattr(tf, "__version__", "<unknown version>")
+  version += " (%s)" % getattr(tf, "__git_version__", "<unknown git version>")
   try:
     if tdir.startswith("<"):
       git_info = "<unknown-dir>"
@@ -187,6 +192,15 @@ def describe_tensorflow_version():
   except Exception as e:
     git_info = "<unknown(git exception: %r)>" % e
   return "%s (%s in %s)" % (version, git_info, tdir)
+
+def get_tensorflow_version_tuple():
+  """
+  :return: tuple of ints, first entry is the major version
+  :rtype: tuple[int]
+  """
+  import tensorflow as tf
+  import re
+  return tuple([int(re.sub('-rc[0-9]', '', s)) for s in tf.__version__.split(".")])
 
 def eval_shell_env(token):
   if token.startswith("$"):
@@ -266,10 +280,13 @@ def model_epoch_from_filename(filename):
 
 
 def terminal_size(): # this will probably work on linux only
-  import os, sys
+  import os, sys, io
   if not hasattr(sys.stdout, "fileno"):
     return -1, -1
-  if not os.isatty(sys.stdout.fileno()):
+  try:
+    if not os.isatty(sys.stdout.fileno()):
+      return -1, -1
+  except io.UnsupportedOperation:
     return -1, -1
   env = os.environ
   def ioctl_GWINSZ(fd):
@@ -293,9 +310,25 @@ def terminal_size(): # this will probably work on linux only
 
 
 def hms(s):
+  """
+  :param float|int s: seconds
+  :return: e.g. "1:23:45" (hs:ms:secs). see hms_fraction if you want to get fractional seconds
+  :rtype: str
+  """
   m, s = divmod(s, 60)
   h, m = divmod(m, 60)
   return "%d:%02d:%02d" % (h, m, s)
+
+
+def hms_fraction(s, decimals=4):
+  """
+  :param float s: seconds
+  :param int decimals: how much decimals to print
+  :return: e.g. "1:23:45.6789" (hs:ms:secs)
+  :rtype: str
+  """
+  return hms(int(s)) + (("%%.0%if" % decimals) % (s - int(s)))[1:]
+
 
 def human_size(n, factor=1000, frac=0.8, prec=1):
   postfixs = ["", "K", "M", "G", "T"]
@@ -324,7 +357,7 @@ def progress_bar(complete = 1.0, prefix = "", suffix = ""):
   bars = '|' * int(complete * ntotal)
   spaces = ' ' * (ntotal - int(complete * ntotal))
   bar = bars + spaces
-  sys.stdout.write("\r%s" % prefix + "[" + bar[:len(bar)/2] + " " + progress + " " + bar[len(bar)/2:] + "]" + suffix)
+  sys.stdout.write("\r%s" % prefix + "[" + bar[:len(bar)//2] + " " + progress + " " + bar[len(bar)//2:] + "]" + suffix)
   sys.stdout.flush()
 
 
@@ -379,7 +412,7 @@ def betterRepr(o):
       return "(%s,)" % o[0]
     return "(%s)" % ", ".join(map(betterRepr, o))
   if isinstance(o, dict):
-    l = [betterRepr(k) + ": " + betterRepr(v) for (k,v) in sorted(o.iteritems())]
+    l = [betterRepr(k) + ": " + betterRepr(v) for (k,v) in sorted(o.items())]
     if sum([len(v) for v in l]) >= 40:
       return "{\n%s}" % "".join([v + ",\n" for v in l])
     else:
@@ -405,7 +438,7 @@ class ObjAsDict:
 
   def __getitem__(self, item):
     if not isinstance(item, (str, unicode)):
-      raise KeyError(e)
+      raise KeyError(item)
     try:
       return getattr(self.__obj, item)
     except AttributeError as e:
@@ -501,7 +534,9 @@ def find_ranges(l):
 
 
 def initThreadJoinHack():
-  import threading, thread
+  if PY3:
+    # Not sure if needed, but also, the code below is slightly broken.
+    return
   mainThread = threading.currentThread()
   assert isinstance(mainThread, threading._MainThread)
   mainThreadId = thread.get_ident()
@@ -553,8 +588,6 @@ def is_quitting():
   return False
 
 def interrupt_main():
-  import thread
-  import threading
   is_main_thread = isinstance(threading.currentThread(), threading._MainThread)
   if is_quitting():  # ignore if we are already quitting
     if is_main_thread:  # strange to get again in main thread
@@ -568,6 +601,36 @@ def interrupt_main():
   else:
     thread.interrupt_main()
     sys.exit(1)  # And exit the thread.
+
+
+class AsyncThreadRun(threading.Thread):
+  def __init__(self, name, func):
+    """
+    :param str name:
+    :param ()->T func:
+    """
+    super(AsyncThreadRun, self).__init__(name=name, target=self.main)
+    self.func = func
+    self.result = None
+    self.daemon = True
+    self.start()
+
+  def main(self):
+    self.result = wrap_async_func(self.func)
+
+  def get(self):
+    self.join()
+    return self.result
+
+
+def wrap_async_func(f):
+  try:
+    import better_exchook
+    better_exchook.install()
+    return f()
+  except Exception:
+    sys.excepthook(*sys.exc_info())
+    interrupt_main()
 
 
 def try_run(func, args=(), catch_exc=Exception, default=None):
@@ -594,6 +657,60 @@ def uniq(seq):
   diffs[1:] = seq[1:] - seq[:-1]
   idx = diffs.nonzero()
   return seq[idx]
+
+
+def slice_pad_zeros(x, begin, end, axis=0):
+  """
+  :param numpy.ndarray x: of shape (..., time, ...)
+  :param int begin:
+  :param int end:
+  :param int axis:
+  :return: basically x[begin:end] (with axis==0) but if begin < 0 or end > x.shape[0],
+   it will not discard these frames but pad zeros, such that the resulting shape[0] == end - begin.
+  :rtype: numpy.ndarray
+  """
+  assert axis == 0, "not yet fully implemented otherwise"
+  pad_left, pad_right = 0, 0
+  if begin < 0:
+    pad_left = -begin
+    begin = 0
+  elif begin >= x.shape[axis]:
+    return np.zeros((end - begin,) + x.shape[1:], dtype=x.dtype)
+  assert end >= begin
+  if end > x.shape[axis]:
+    pad_right = end - x.shape[axis]
+    end = x.shape[axis]
+  return np.pad(x[begin:end], [(pad_left, pad_right)] + [(0, 0)] * (x.ndim - 1), mode="constant")
+
+
+def random_orthogonal(shape, gain=1., seed=None):
+  """
+  Returns a random orthogonal matrix of the given shape.
+  Code borrowed and adapted from Keras: https://github.com/fchollet/keras/blob/master/keras/initializers.py
+  Reference: Saxe et al., http://arxiv.org/abs/1312.6120
+  Related: Unitary Evolution Recurrent Neural Networks, https://arxiv.org/abs/1511.06464
+
+  :param tuple[int] shape:
+  :param float gain:
+  :param int seed: for Numpy random generator
+  :return: random orthogonal matrix
+  :rtype: numpy.ndarray
+  """
+  num_rows = 1
+  for dim in shape[:-1]:
+    num_rows *= dim
+  num_cols = shape[-1]
+  flat_shape = (num_rows, num_cols)
+  if seed is not None:
+    rnd = np.random.RandomState(seed=seed)
+  else:
+    rnd = np.random
+  a = rnd.normal(0.0, 1.0, flat_shape)
+  u, _, v = np.linalg.svd(a, full_matrices=False)
+  # Pick the one with the correct shape.
+  q = u if u.shape == flat_shape else v
+  q = q.reshape(shape)
+  return gain * q[:shape[0], :shape[1]]
 
 
 _have_inplace_increment = None
@@ -761,6 +878,17 @@ def json_remove_comments(string, strip_space=True):
   return ''.join(new_str)
 
 
+def unicode_to_str_recursive(s):
+  if isinstance(s, dict):
+    return {unicode_to_str_recursive(key): unicode_to_str_recursive(value) for key, value in s.items()}
+  elif isinstance(s, list):
+    return [unicode_to_str_recursive(element) for element in s]
+  elif isinstance(s, unicode):
+    return s.encode('utf-8')
+  else:
+    return s
+
+
 def load_json(filename=None, content=None):
   if content:
     assert not filename
@@ -772,6 +900,8 @@ def load_json(filename=None, content=None):
     json_content = json.loads(content)
   except ValueError as e:
     raise Exception("config looks like JSON but invalid json content, %r" % e)
+  if not PY3:
+    json_content = unicode_to_str_recursive(json_content)
   return json_content
 
 
@@ -804,12 +934,19 @@ class NumbersDict:
   def copy(self):
     return NumbersDict(self)
 
+  def constant_like(self, number):
+    return NumbersDict(
+      broadcast_value=number if (self.value is not None) else None,
+      numbers_dict={k: number for k in self.dict.keys()})
+
   @property
   def keys_set(self):
     return set(self.dict.keys())
 
   def __getitem__(self, key):
-    return self.dict.get(key, self.value)
+    if self.value is not None:
+      return self.dict.get(key, self.value)
+    return self.dict[key]
 
   def __setitem__(self, key, value):
     self.dict[key] = value
@@ -818,7 +955,8 @@ class NumbersDict:
     del self.dict[key]
 
   def get(self, key, default=None):
-    return self.dict.get(key, default)
+    # Keep consistent with self.__get_item__. If self.value is set, this will always be the default value.
+    return self.dict.get(key, self.value if self.value is not None else default)
 
   def pop(self, key, *args):
     return self.dict.pop(key, *args)
@@ -839,6 +977,14 @@ class NumbersDict:
   def has_values(self):
     return bool(self.dict) or self.value is not None
 
+  def unary_op(self, op):
+    res = NumbersDict()
+    if self.value is not None:
+      res.value = op(self.value)
+    for k, v in self.dict.items():
+      res.dict[k] = op(v)
+    return res
+
   @classmethod
   def bin_op_scalar_optional(cls, self, other, zero, op):
     if self is None and other is None:
@@ -852,14 +998,17 @@ class NumbersDict:
   @classmethod
   def bin_op(cls, self, other, op, zero, result=None):
     if not isinstance(self, NumbersDict):
-      self = NumbersDict(self)
+      if isinstance(other, NumbersDict):
+        self = other.constant_like(self)
+      else:
+        self = NumbersDict(self)
     if not isinstance(other, NumbersDict):
-      other = NumbersDict(other)
+      other = self.constant_like(other)
     if result is None:
       result = NumbersDict()
     assert isinstance(result, NumbersDict)
     for k in self.keys_set | other.keys_set:
-      result[k] = cls.bin_op_scalar_optional(self[k], other[k], zero=zero, op=op)
+      result[k] = cls.bin_op_scalar_optional(self.get(k, None), other.get(k, None), zero=zero, op=op)
     result.value = cls.bin_op_scalar_optional(self.value, other.value, zero=zero, op=op)
     return result
 
@@ -891,23 +1040,45 @@ class NumbersDict:
   def __div__(self, other):
     return self.bin_op(self, other, op=lambda a, b: a / b, zero=1)
 
-  def __rdiv__(self, other):
-    return self.bin_op(self, other, op=lambda a, b: b / a, zero=1)
+  __rdiv__ = __div__
+  __truediv__ = __div__
 
   def __idiv__(self, other):
     return self.bin_op(self, other, op=lambda a, b: a / b, zero=1, result=self)
 
-  def elem_eq(self, other, result_with_default=False):
+  __itruediv__ = __idiv__
+
+  def __floordiv__(self, other):
+    return self.bin_op(self, other, op=lambda a, b: a // b, zero=1)
+
+  def __ifloordiv__(self, other):
+    return self.bin_op(self, other, op=lambda a, b: a // b, zero=1, result=self)
+
+  def __neg__(self):
+    return self.unary_op(op=lambda a: -a)
+
+  def __bool__(self):
+    return any(self.values())
+
+  __nonzero__ = __bool__  # Python 2
+
+  def elem_eq(self, other, result_with_default=True):
     """
     Element-wise equality check with other.
     Note about broadcast default value: Consider some key which is neither in self nor in other.
       This means that self[key] == self.default, other[key] == other.default.
       Thus, in case that self.default != other.default, we get res.default == False.
       Then, all(res.values()) == False, even when all other values are True.
-      This is often not what we want.
+      This is sometimes not what we want.
       You can control the behavior via result_with_default.
     """
-    res = self.bin_op(self, other, op=lambda a, b: a == b, zero=None)
+    def op(a, b):
+      if a is None:
+        return None
+      if b is None:
+        return None
+      return a == b
+    res = self.bin_op(self, other, op=op, zero=None)
     if not result_with_default:
       res.value = None
     return res
@@ -923,31 +1094,50 @@ class NumbersDict:
     # and it would just confuse.
     raise Exception("%s.__cmp__ is undefined" % self.__class__.__name__)
 
+  @staticmethod
+  def _max(*args):
+    args = [a for a in args if a is not None]
+    if not args:
+      return None
+    if len(args) == 1:
+      return args[0]
+    return max(*args)
+
+  @staticmethod
+  def _min(*args):
+    args = [a for a in args if a is not None]
+    if not args:
+      return None
+    if len(args) == 1:
+      return args[0]
+    return min(*args)
+
   @classmethod
   def max(cls, items):
     """
     Element-wise maximum for item in items.
+    :param list[NumbersDict|int|float] items:
+    :rtype: NumbersDict
     """
-    if not items:
-      return None
+    assert items
     if len(items) == 1:
-      return items[0]
+      return NumbersDict(items[0])
     if len(items) == 2:
-      # max(x, None) == x, so this works.
-      return cls.bin_op(items[0], items[1], op=max, zero=None)
+      return cls.bin_op(items[0], items[1], op=cls._max, zero=None)
     return cls.max([items[0], cls.max(items[1:])])
 
   @classmethod
   def min(cls, items):
     """
     Element-wise minimum for item in items.
+    :param list[NumbersDict|int|float] items:
+    :rtype: NumbersDict
     """
-    if not items:
-      return None
+    assert items
     if len(items) == 1:
-      return items[0]
+      return NumbersDict(items[0])
     if len(items) == 2:
-      return cls.bin_op(items[0], items[1], op=min, zero=None)
+      return cls.bin_op(items[0], items[1], op=cls._min, zero=None)
     return cls.min([items[0], cls.min(items[1:])])
 
   @staticmethod
@@ -972,14 +1162,72 @@ class NumbersDict:
            self.__class__.__name__, self.dict, self.value)
 
 
-def collect_class_init_kwargs(cls):
-  kwargs = set()
+def collect_class_init_kwargs(cls, only_with_default=False):
+  """
+  :param type cls: class, where it assumes that kwargs are passed on to base classes
+  :param bool only_with_default: if given will only return the kwargs with default values
+  :return: set if not with_default, otherwise the dict to the default values
+  :rtype: list[str] | dict[str]
+  """
+  from collections import OrderedDict
+  if only_with_default:
+    kwargs = OrderedDict()
+  else:
+    kwargs = []
+  if PY3:
+    getargspec = inspect.getfullargspec
+  else:
+    getargspec = inspect.getargspec
   for cls_ in inspect.getmro(cls):
-    if not inspect.ismethod(cls_.__init__):  # Python function. could be builtin func or so
+    # Check Python function. Could be builtin func or so. Python 2 getargspec does not work in that case.
+    if not inspect.ismethod(cls_.__init__) and not inspect.isfunction(cls_.__init__):
       continue
-    arg_spec = inspect.getargspec(cls_.__init__)
-    kwargs.update(arg_spec.args[1:])  # first arg is self, ignore
+    arg_spec = getargspec(cls_.__init__)
+    args = arg_spec.args[1:]  # first arg is self, ignore
+    if only_with_default:
+      assert len(arg_spec.defaults) <= len(args)
+      args = args[len(args) - len(arg_spec.defaults):]
+      assert len(arg_spec.defaults) == len(args), arg_spec
+      for arg, default in zip(args, arg_spec.defaults):
+        kwargs[arg] = default
+    else:
+      for arg in args:
+        if arg not in kwargs:
+          kwargs.append(arg)
   return kwargs
+
+
+def collect_mandatory_class_init_kwargs(cls):
+  """
+  :param type cls:
+  :return: list of kwargs which have no default, i.e. which must be provided
+  :rtype: list[str]
+  """
+  all_kwargs = collect_class_init_kwargs(cls, only_with_default=False)
+  default_kwargs = collect_class_init_kwargs(cls, only_with_default=True)
+  mandatory_kwargs = []
+  for arg in all_kwargs:
+    if arg not in default_kwargs:
+      mandatory_kwargs.append(arg)
+  return mandatory_kwargs
+
+
+def help_on_type_error_wrong_args(cls, kwargs):
+  """
+  :param type cls:
+  :param list[str] kwargs:
+  """
+  mandatory_args = collect_mandatory_class_init_kwargs(cls)
+  for arg in kwargs:
+    if arg in mandatory_args:
+      mandatory_args.remove(arg)
+  all_kwargs = collect_class_init_kwargs(cls)
+  unknown_args = []
+  for arg in kwargs:
+    if arg not in all_kwargs:
+      unknown_args.append(arg)
+  if mandatory_args or unknown_args:
+    print("Args mismatch? Missing are %r, unknowns are %r." % (mandatory_args, unknown_args))
 
 
 def custom_exec(source, source_filename, user_ns, user_global_ns):
@@ -1064,6 +1312,9 @@ def load_txt_vector(filename):
   Expect line-based text encoding in file.
   We also support Sprint XML format, which has some additional xml header and footer,
   which we will just strip away.
+
+  :param str filename:
+  :rtype: list[float]
   """
   return [float(l) for l in open(filename).read().splitlines() if l and not l.startswith("<")]
 
@@ -1269,7 +1520,10 @@ def get_login_username():
   :return: the username of the current user.
   Use this as a replacement for os.getlogin().
   """
-  import pwd, os
+  import os
+  if sys.platform == 'win32':
+    return os.getlogin()
+  import pwd
   return pwd.getpwuid(os.getuid())[0]
 
 
@@ -1284,3 +1538,236 @@ def get_temp_dir():
     if dirname:
       return "%s/%s" % (dirname, username)
   return "/tmp/%s" % username
+
+
+class LockFile(object):
+  def __init__(self, directory, name="lock_file", lock_timeout=1 * 60 * 60):
+    """
+    :param str directory:
+    :param int|float lock_timeout: in seconds
+    """
+    self.directory = directory
+    self.name = name
+    self.fd = None
+    self.lock_timeout = lock_timeout
+    self.lockfile = "%s/%s" % (directory, name)
+
+  def is_old_lockfile(self):
+    try:
+      mtime = os.path.getmtime(self.lockfile)
+    except OSError:
+      mtime = None
+    if mtime and (abs(time.time() - mtime) > self.lock_timeout):
+      return True
+    return False
+
+  def maybe_remove_old_lockfile(self):
+    if not self.is_old_lockfile():
+      return
+    print("Removing old lockfile %r (probably crashed proc)." % self.lockfile)
+    try:
+      os.remove(self.lockfile)
+    except OSError as exc:
+      print("Remove lockfile exception %r. Ignoring it." % exc)
+
+  def is_locked(self):
+    if self.is_old_lockfile():
+      return False
+    try:
+      return os.path.exists(self.lockfile)
+    except OSError:
+      return False
+
+  def lock(self):
+    import time
+    import errno
+    while True:
+      # Try to create directory if it does not exist.
+      try:
+        os.makedirs(self.directory)
+      except OSError:
+        pass  # Ignore any errors.
+      # Now try to create the lock.
+      try:
+        self.fd = os.open(self.lockfile, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        return
+      except OSError as exc:
+        # Possible errors:
+        # ENOENT (No such file or directory), e.g. if the directory was deleted.
+        # EEXIST (File exists), if the lock already exists.
+        if exc.errno not in [errno.ENOENT, errno.EEXIST]:
+          raise  # Other error, so reraise.
+      # We did not get the lock.
+      # Check if it is a really old one.
+      self.maybe_remove_old_lockfile()
+      # Wait a bit, and then retry.
+      time.sleep(1)
+
+  def unlock(self):
+    os.close(self.fd)
+    os.remove(self.lockfile)
+
+  def __enter__(self):
+    self.lock()
+
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    self.unlock()
+
+
+def str_is_number(s):
+  """
+  :param str s: e.g. "1", ".3" or "x"
+  :return: whether s can be casted to float or int
+  :rtype: bool
+  """
+  try:
+    float(s)
+    return True
+  except ValueError:
+    return False
+
+
+def sorted_values_from_dict(d):
+  assert isinstance(d, dict)
+  return [v for (k, v) in sorted(d.items())]
+
+
+def dict_zip(keys, values):
+  assert len(keys) == len(values)
+  return dict(zip(keys, values))
+
+
+def parse_ld_conf_file(fn):
+  """
+  Via https://github.com/albertz/system-tools/blob/master/bin/find-lib-in-path.py.
+  :param str fn: e.g. "/etc/ld.so.conf"
+  :return: list of paths for libs
+  :rtype: list[str]
+  """
+  from glob import glob
+  paths = []
+  for l in open(fn).read().splitlines():
+    l = l.strip()
+    if not l:
+      continue
+    if l.startswith("#"):
+      continue
+    if l.startswith("include "):
+      for sub_fn in glob(l[len("include "):]):
+        paths.extend(parse_ld_conf_file(sub_fn))
+      continue
+    paths.append(l)
+  return paths
+
+
+def get_ld_paths():
+  """
+  To be very correct, see man-page of ld.so.
+  And here: http://unix.stackexchange.com/questions/354295/what-is-the-default-value-of-ld-library-path/354296
+  Short version, not specific to an executable, in this order:
+  - LD_LIBRARY_PATH
+  - /etc/ld.so.cache (instead we will parse /etc/ld.so.conf)
+  - /lib, /usr/lib (or maybe /lib64, /usr/lib64)
+  Via https://github.com/albertz/system-tools/blob/master/bin/find-lib-in-path.py.
+
+  :rtype: list[str]
+  :return: list of paths to search for libs (*.so files)
+  """
+  paths = []
+  if "LD_LIBRARY_PATH" in os.environ:
+    paths.extend(os.environ["LD_LIBRARY_PATH"].split(":"))
+  if os.path.exists("/etc/ld.so.conf"):
+    paths.extend(parse_ld_conf_file("/etc/ld.so.conf"))
+  paths.extend(["/lib", "/usr/lib", "/lib64", "/usr/lib64"])
+  return paths
+
+
+def find_lib(lib_name):
+  """
+  :param str lib_name: without postfix/prefix, e.g. "cudart" or "blas"
+  :return: returns full path to lib or None
+  :rtype: str|None
+  """
+  if sys.platform == "darwin":
+    prefix = "lib"
+    postfix = ".dylib"
+  elif sys.platform == "win32":
+    prefix = ""
+    postfix = ".dll"
+  else:
+    prefix = "lib"
+    postfix = ".so"
+  for path in get_ld_paths():
+    fn = "%s/%s%s%s" % (path, prefix, lib_name, postfix)
+    if os.path.exists(fn):
+      return fn
+  return None
+
+
+def read_sge_num_procs(job_id=None):
+  """
+  From the Sun Grid Engine (SGE), reads the num_proc setting for a particular job.
+  If job_id is not provided and the JOB_ID env is set, it will use that instead (i.e. it uses the current job).
+  This calls qstat to figure out this setting. There are multiple ways this can go wrong,
+  so better catch any exception.
+
+  :param int|None job_id:
+  :return: num_proc
+  :rtype: int|None
+  """
+  if not job_id:
+    if not os.environ.get("SGE_ROOT"):
+      return None
+    try:
+      job_id = int(os.environ.get("JOB_ID") or 0)
+    except ValueError as exc:
+      raise Exception("read_sge_num_procs: %r, invalid JOB_ID: %r" % (exc, os.environ.get("JOB_ID")))
+    if not job_id:
+      return None
+  from subprocess import Popen, PIPE, CalledProcessError
+  cmd = ["qstat", "-j", str(job_id)]
+  proc = Popen(cmd, stdout=PIPE)
+  stdout, _ = proc.communicate()
+  if proc.returncode:
+    raise CalledProcessError(proc.returncode, cmd, stdout)
+  stdout = stdout.decode("utf8")
+  ls = [l[len("hard resource_list:"):].strip() for l in stdout.splitlines() if l.startswith("hard resource_list:")]
+  assert len(ls) == 1
+  opts = dict([opt.split("=", 1) for opt in ls[0].split(",")])
+  try:
+    return int(opts["num_proc"])
+  except ValueError as exc:
+    raise Exception("read_sge_num_procs: %r, invalid num_proc %r for job id %i.\nline: %r" % (
+      exc, opts["num_proc"], job_id, ls[0]))
+
+
+def try_and_ignore_exception(f):
+  try:
+    f()
+  except Exception as exc:
+    print("try_and_ignore_exception: %r failed: %s" % (f, exc))
+    sys.excepthook(*sys.exc_info())
+
+
+def try_get_caller_name(depth=1, fallback=None):
+  """
+  :param int depth:
+  :param str|None fallback: this is returned if we fail for some reason
+  :rtype: str|None
+  :return: caller function name. this is just for debugging
+  """
+  try:
+    frame = sys._getframe(depth + 1)  # one more to count ourselves
+    return frame.f_code.co_name
+  except Exception:
+    return fallback
+
+
+def camel_case_to_snake_case(name):
+  """
+  :param str name: e.g. "CamelCase"
+  :return: e.g. "camel_case"
+  :rtype: str
+  """
+  s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+  return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()

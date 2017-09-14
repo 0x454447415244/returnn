@@ -1,3 +1,6 @@
+
+from __future__ import print_function
+
 from TaskSystem import AsyncTask, ProcConnectionDied
 from Updater import Updater
 from Util import cmd, progress_bar, dict_diff_str, hms, start_daemon_thread, interrupt_main, CalledProcessError, NumbersDict, custom_exec, dict_joined, attr_chain
@@ -254,7 +257,7 @@ class Device(object):
       try:
         pynvml.nvmlInit()
       except Exception as exc:
-        print >> log.v3, "nvmlInit failed: %s" % exc
+        print("nvmlInit failed: %s" % exc, file=log.v3)
     self.num_batches = num_batches
     self.blocking = blocking
     self.config = config
@@ -319,7 +322,19 @@ class Device(object):
       async_str = "async (pid %i, ppid %i)" % (os.getpid(), os.getppid())
     return "<Device %s %s>" % (self.name, async_str)
 
-  def startProc(self, device_tag):
+  def startProc(self, *args, **kwargs):
+    import better_exchook
+    better_exchook.install()
+    try:
+      self._startProc(*args, **kwargs)
+    except BaseException:
+      try:
+        sys.excepthook(*sys.exc_info())
+      finally:
+        # Exceptions are fatal. Stop now.
+        interrupt_main()
+
+  def _startProc(self, device_tag):
     assert not self.blocking
     # Note that we want a really new separate process, i.e. fork+exec, not just a fork.
     # This is to avoid many potential bugs, e.g. in Numpy or Theano.
@@ -363,8 +378,8 @@ class Device(object):
       self.num_train_params = self.output_queue.recv(); """ :type: int """  # = len(trainnet.gparams)
       self.sync_used_targets()
     except ProcConnectionDied as e:
-      print >>log.v3, "Device proc %s (%s) died: %r" % (self.name, device_tag, e)
-      print >>log.v5, "Theano flags:", env_update["THEANO_FLAGS"]
+      print("Device proc %s (%s) died: %r" % (self.name, device_tag, e), file=log.v3)
+      print("Theano flags:", env_update["THEANO_FLAGS"], file=log.v5)
       interrupt_main()
     if self.device_name in get_device_attributes().keys():
       self.attributes = get_device_attributes()[self.device_name]
@@ -377,8 +392,8 @@ class Device(object):
     for output in fn.outputs:
       if numpy.isnan(output[0]).any():
         #theano.printing.debugprint(node)
-        print('Inputs : %s' % [input[0] for input in fn.inputs])
-        print('Outputs: %s' % [output[0] for output in fn.outputs])
+        print(('Inputs : %s' % [input[0] for input in fn.inputs]))
+        print(('Outputs: %s' % [output[0] for output in fn.outputs]))
         assert False, '*** NaN detected ***'
 
   def initialize(self, config, update_specs=None, json_content=None, train_param_args=None):
@@ -435,7 +450,7 @@ class Device(object):
       model.close()
     # initialize batch
     self.used_data_keys = self.trainnet.get_used_data_keys()
-    print >> log.v4, "Device train-network: Used data keys:", self.used_data_keys
+    print("Device train-network: Used data keys:", self.used_data_keys, file=log.v4)
     assert "data" in self.used_data_keys
     self.y = {k: theano.shared(numpy.zeros((1,) * self.trainnet.y[k].ndim, dtype=self.trainnet.y[k].dtype),
                                borrow=True, name='y_%s' % k)
@@ -468,14 +483,14 @@ class Device(object):
               if isinstance(keys, list):
                 gparam = T.grad(T.sum([self.trainnet.costs[k] * param.layer.cost_scale() for k in keys]), param, known_grads=OrderedDict(self.trainnet.known_grads))
               else:
-                gparam = T.grad(self.trainnet.costs[param.layer.attrs['cost']] * param.layer.cost_scale(), param, known_grads=OrderedDict(self.trainnet.known_grads))
+                gparam = T.grad((self.trainnet.costs[param.layer.attrs['cost']] + param.layer.make_constraints()) * param.layer.cost_scale(), param, known_grads=OrderedDict(self.trainnet.known_grads))
             else:
               gparam = T.grad(self.trainnet.get_objective(), param, known_grads=OrderedDict(self.trainnet.known_grads))
           except theano.gradient.DisconnectedInputError:
             gparam = 0
         if gparam == 0:
           exclude.append(param)
-          print >> log.v4, "exclude:", self.name, param.name
+          print("exclude:", self.name, param.name, file=log.v4)
           gparams.append(T.constant(0))
           continue
         #update_specs['layers'].append(param.layer.name)
@@ -495,6 +510,22 @@ class Device(object):
     self.block_end = T.lscalar()
     self.epoch_var = theano.shared(numpy.zeros((), dtype="int32"), name="epoch_var")
     self.tags_var  = theano.shared(numpy.zeros((0, 0), dtype="int8"), name="tags_var")
+
+    self.streams = []
+    output_streams = {'train' : [],'eval' : []}
+    if config.has('stream'):
+      from NetworkStream import NetworkStream
+      for stream in config.value('stream', '').split():  # usage: layer_name.member_var:port
+        stream, port = stream.split(':')
+        layer, member = stream.split('.')
+        self.streams.append(NetworkStream(stream, int(port)))
+        for key in ['train', 'eval']:
+          net = self.trainnet if key == 'train' else self.testnet
+          ctx  = net.hidden[layer] if layer in net.hidden else net.output[layer]
+          if hasattr(ctx,member):
+            output_streams[key].append(getattr(ctx,member))
+          elif member in ctx.attrs:
+            output_streams[key].append(ctx.attrs['member'])
 
     self.forwarder = None
     if self.network_task in ['train', 'theano_graph']:
@@ -516,9 +547,9 @@ class Device(object):
       elif self.update_specs['update_rule'] != 'none':
         self.updater = Updater.initRule(self.update_specs['update_rule'], **self.update_specs['update_params'])
 
-      # The function output lists must be consistent with TrainTaskThread.evaluate().
       self.train_outputs_format = ["cost:" + out for out in sorted(self.trainnet.costs.keys())]
-      outputs = [self.trainnet.costs[out] for out in sorted(self.trainnet.costs.keys())]
+      # The function output lists must be consistent with TrainTaskThread.evaluate()
+      outputs = output_streams['train'] + [self.trainnet.costs[out] for out in sorted(self.trainnet.costs.keys())]
       if self.trainnet.ctc_priors is not None:
         self.train_outputs_format += ["ctc_priors"]
         outputs += [self.trainnet.ctc_priors]
@@ -556,7 +587,7 @@ class Device(object):
 
       self.test_outputs_format = ["cost:" + out for out in sorted(self.testnet.costs.keys())]
       self.test_outputs_format += ["error:" + out for out in sorted(self.testnet.errors.keys())]
-      test_outputs = [self.testnet.costs[out] for out in sorted(self.testnet.costs.keys())]
+      test_outputs = output_streams['eval'] + [self.testnet.costs[out] for out in sorted(self.testnet.costs.keys())]
       test_outputs += [self.testnet.errors[out] for out in sorted(self.testnet.errors.keys())]
       self.tester = theano.function(inputs=[self.block_start, self.block_end],
                                     outputs=test_outputs,
@@ -569,7 +600,7 @@ class Device(object):
       test_givens = self.make_givens(self.testnet)
       self.test_outputs_format = ["cost:" + out for out in sorted(self.testnet.costs.keys())]
       self.test_outputs_format += ["error:" + out for out in sorted(self.testnet.errors.keys())]
-      test_outputs = [self.testnet.costs[out] for out in sorted(self.testnet.costs.keys())]
+      test_outputs = output_streams['eval'] + [self.testnet.costs[out] for out in sorted(self.testnet.costs.keys())]
       test_outputs += [self.testnet.errors[out] for out in sorted(self.testnet.errors.keys())]
       self.tester = theano.function(inputs=[self.block_start, self.block_end],
                                     outputs=test_outputs,
@@ -581,7 +612,7 @@ class Device(object):
     elif self.network_task in ['forward', 'daemon', 'compute_priors']:
       output_layer_name = config.value("extract_output_layer_name", "output")
       extractions = config.list('extract', ['log-posteriors'])
-      source = []
+      source = output_streams['eval']
       givens = self.make_input_givens(self.testnet)
       for extract in extractions:
         param = None
@@ -589,8 +620,7 @@ class Device(object):
           param = extract.split(':')[1]
           extract = extract.split(':')[0]
         if extract == "classification":
-          #source.append(T.argmax(self.testnet.get_layer('output').p_y_given_x, axis=-1).reshape(self.testnet.get_layer('output').index.shape).dimshuffle(0,1,'x'))
-          source.append(T.argmax(self.testnet.get_layer('output').p_y_given_x, axis=-1).dimshuffle(0, 1, 'x'))
+          source.append(T.argmax(self.testnet.get_layer(output_layer_name).p_y_given_x, axis=-1).dimshuffle(0, 1, 'x'))
         elif extract == "log-posteriors":
           if not param:
             param = output_layer_name
@@ -647,6 +677,48 @@ class Device(object):
           assert p_y_given_x.ndim == 3
           source.append(
             T.switch(T.cast(index, "float32").dimshuffle(0, 1, 'x'), p_y_given_x, numpy.float32(0)))
+        elif extract == "win_post":
+          layer = self.testnet.get_layer(output_layer_name)
+          p_y_given_x = getattr(layer, "p_y_given_x", layer.output)
+          from NetworkHiddenLayer import SegmentFinalStateLayer
+          if isinstance(layer.sources[0],SegmentFinalStateLayer):
+            w = layer.sources[0].base[0].attrs['win']
+            t = layer.sources[0].base[0].timesteps
+            b = layer.sources[0].base[0].batches
+            fullind = layer.sources[0].fullind.T
+            p_y_given_x = p_y_given_x.reshape((p_y_given_x.shape[0]*p_y_given_x.shape[1],p_y_given_x.shape[2]))
+          else:
+            w = layer.copy_output.attrs['win']
+            t = layer.copy_output.timesteps
+            b = layer.copy_output.batches
+            from TheanoUtil import window_batch_timewise
+            fullind = window_batch_timewise(t,b,w,layer.copy_output.fullind)
+            fullind = fullind.T
+            p_y_given_x = p_y_given_x.reshape((p_y_given_x.shape[0]*p_y_given_x.shape[1],p_y_given_x.shape[2]))[fullind.flatten()]
+          zer = T.zeros((p_y_given_x.shape[1],1))
+          fullind1 = fullind.repeat(p_y_given_x.shape[1]).reshape((fullind.flatten().shape[0],p_y_given_x.shape[1]))
+          p_y_given_x1 = T.switch(fullind1>=0, p_y_given_x, 0)
+          p_y_given_x1 = p_y_given_x1.reshape((t*b,w*p_y_given_x1.shape[1]))
+          p_y_given_x1 = p_y_given_x1.reshape((b,t,p_y_given_x1.shape[1])).dimshuffle(1,0,2)
+          assert p_y_given_x1.ndim == 3
+          source.append(T.log(p_y_given_x1))
+        elif extract == "win_post_full":
+          layer = self.testnet.get_layer(output_layer_name)
+          p_y_given_x = layer.z
+          w = layer.sources[0].base[0].attrs['win']
+          t = layer.sources[0].base[0].timesteps
+          b = layer.sources[0].base[0].batches
+          fullind = layer.sources[0].fullind.T#.flatten()
+          p_y_given_x = p_y_given_x.reshape((p_y_given_x.shape[0]*p_y_given_x.shape[1],p_y_given_x.shape[2]))
+          zer = T.zeros((p_y_given_x.shape[1],1))
+          fullind1 = fullind.repeat(p_y_given_x.shape[1]).reshape((fullind.flatten().shape[0],p_y_given_x.shape[1]))
+          min_p = T.min(p_y_given_x,axis=-1).repeat(p_y_given_x.shape[1]).reshape((p_y_given_x.shape[0],p_y_given_x.shape[1]))
+          p_y_given_x1 = T.switch(fullind1>=0, p_y_given_x, min_p)
+          p_y_given_x1 = p_y_given_x1.reshape((t*b,w*p_y_given_x1.shape[1]))
+          py_win = T.nnet.softmax(p_y_given_x1)
+          py_win = py_win.reshape((b,t,py_win.shape[1])).dimshuffle(1,0,2)
+          assert py_win.ndim == 3
+          source.append(py_win)
         elif extract == "posteriors-sum":
           layer = self.testnet.get_layer(output_layer_name)
           p_y_given_x = layer.p_y_given_x
@@ -662,7 +734,7 @@ class Device(object):
             if self.testnet.hidden[hidden].layer_class == "conv":
               source.append(self.testnet.hidden[hidden].output)
             else:
-              print(str(self.testnet.hidden[hidden]))
+              print((str(self.testnet.hidden[hidden])))
           # for single layer only
           #if self.testnet.hidden["c1"].layer_class == "conv":
           #  source.append(self.testnet.hidden["c1"].output)
@@ -696,30 +768,32 @@ class Device(object):
             hidden = self.testnet.reverse_hidden[-idx - 1]
           source.append(T.reshape(hidden.output[target], (hidden.output[target].shape[0] * hidden.output[target].shape[1], hidden.output[target].shape[2])))
         elif extract in self.testnet.hidden.keys():
-          if param is not None:
-            param = int(param)
+          if param is None:
+            param = 'output'
           hidden = self.testnet.hidden[extract]
           if hidden.layer_class == 'mdlstm':
             source.append(T.sum(hidden.output,axis=0))
           else:
-            signal = hidden.output[param].dimshuffle('x',0,1) if param is not None else hidden.output
-            sidx = hidden.index[param].dimshuffle('x',0) if param is not None else hidden.index
+            signal = getattr(hidden, param)
+            if signal.ndim == 2:
+              signal = signal.dimshuffle('x',0,1)
+            sidx = hidden.index.dimshuffle('x',0)
             source.append(signal * sidx.dimshuffle(0,1,'x').repeat(signal.shape[2],axis=2))
         elif extract in self.testnet.output:
-          if param is not None:
-            param = int(param)
+          if param is None:
+            param = 'output'
           hidden = self.testnet.output[extract]
-          signal = hidden.output[param].dimshuffle('x', 0, 1) if param is not None else hidden.output
+          signal = getattr(hidden, param)
+          if param == 'attention' and extract == 'aln':
+            n = signal.shape[0]
+            b = signal.shape[1]
+            t = signal.shape[2]
+            signal = signal.dimshuffle(1,0,2).reshape((signal.shape[0],signal.shape[1]*signal.shape[2])).argmax(axis=-1).reshape((n,b))
+            signal = signal.dimshuffle(0,1,'x')
+          assert signal.ndim == 3, "extraction variable has to be of shape (time,batch,dimension)"
           source.append(signal)
         elif extract == 'input':
           source.append(self.testnet.x.reshape((self.testnet.i.shape[0], self.testnet.i.shape[1], self.testnet.x.shape[2])) * T.cast(self.testnet.i.dimshuffle(0,1,'x').repeat(self.testnet.x.shape[2],axis=2),'float32'))
-        elif extract == 'attention':
-          assert param
-          idx = T.cast(self.testnet.hidden[param].index,'float32').dimshuffle(0,1,'x').repeat(self.testnet.hidden[param].attention[0].shape[2],axis=2)
-          source.append(self.testnet.hidden[param].attention[0] * idx)
-        elif extract == 'alignment':
-          idx = T.cast(self.testnet.hidden[param].base[0].index,'float32').dimshuffle(0,1,'x')
-          source.append(self.testnet.hidden[param].alignment[0].dimshuffle(0,1,'x') * idx)
         else:
           assert False, "invalid extraction: " + extract
       self.extractor = theano.function(inputs = [],
@@ -749,7 +823,7 @@ class Device(object):
     batch_dim = self.y["data"].get_value(borrow=True, return_internal_type=True).shape[1]
     block_size = self.block_size if self.block_size else batch_dim
     if self.config.bool("debug_shell_first_compute", False):
-      print >>log.v1, "debug_shell_first_compute"
+      print("debug_shell_first_compute", file=log.v1)
       Debug.debug_shell(user_ns=locals(), user_global_ns=globals())
     if task == "train" or task == "theano_graph" or task == "eval":
       func = self.tester if task == "eval" else self.trainer
@@ -774,7 +848,7 @@ class Device(object):
       assert False, "invalid command: " + task
     compute_end_time = time.time()
     if self.config.bool("debug_batch_compute_time", False):
-      print >>log.v1, "batch compute time:", compute_end_time - compute_start_time
+      print("batch compute time:", compute_end_time - compute_start_time, file=log.v1)
     self.compute_total_time += compute_end_time - compute_start_time
     # output is a list the outputs which we specified when creating the Theano function in self.initialize().
     assert len(output) > 0  # In all cases, we have some output.
@@ -784,15 +858,22 @@ class Device(object):
     elif task == "eval":
       outputs_format = self.test_outputs_format
 
+    # stream handling
+    if(self.streams):
+      stream_outputs = output[:len(self.streams)]
+      output = output[len(self.streams):]
+      for stream, out in zip(self.streams, stream_outputs):
+        stream.update(task, out, self.tags)
+
     # In train, first output is the score.
     # If this is inf/nan, our model is probably broken.
     model_broken_short_info = self.fast_check_model_is_broken_from_result(output, outputs_format)
     if model_broken_short_info:
-      print >>log.v3, "Model looks broken:", model_broken_short_info
+      print("Model looks broken:", model_broken_short_info, file=log.v3)
       if self.config.bool("dump_model_broken_info", False):
         self.dump_model_broken_info(model_broken_short_info)
       if self.config.bool("debug_shell_model_broken", False):
-        print >>log.v1, "debug_shell_model_broken"
+        print("debug_shell_model_broken", file=log.v1)
         Debug.debug_shell(user_ns=locals(), user_global_ns=globals())
     # Pass on, let the Engine decide what to do (or also just fail).
 
@@ -830,9 +911,9 @@ class Device(object):
           i += 1
         dump_file_name = "%s.%i" % (dump_file_name, i)
       f = open(dump_file_name, "w")
-      print >> log.v1, "Dumping model broken info to file %r." % dump_file_name
+      print("Dumping model broken info to file %r." % dump_file_name, file=log.v1)
     except Exception as e:
-      print >> log.v3, "Exception while opening model broken dump file. %s" % e
+      print("Exception while opening model broken dump file. %s" % e, file=log.v3)
       return
     collected_info = {"info_str": str(info)}
     try:
@@ -840,17 +921,17 @@ class Device(object):
       collected_info["dev_targets"] = numpy.asarray(self.y["classes"].get_value()) #TODO fix for multiple targets with other labels
       collected_info["dev_index"] = numpy.asarray(self.j["data"].get_value())
     except Exception as e:
-      print >> log.v3, "Exception when getting device data. %s" % e
+      print("Exception when getting device data. %s" % e, file=log.v3)
     try:
       train_params = [numpy.asarray(v.get_value()) for v in self.trainnet.train_params_vars]
       collected_info["train_params"] = train_params
     except Exception as e:
-      print >> log.v3, "Exception when getting train params. %s" % e
+      print("Exception when getting train params. %s" % e, file=log.v3)
     try:
       pickle.dump(collected_info, f)
       f.close()
     except Exception as e:
-      print >> log.v3, "Exception when writing model broken info dump. %s" % e
+      print("Exception when writing model broken info dump. %s" % e, file=log.v3)
 
   def _checkGpuFuncs(self, device, device_id):
     if device[0:3] != 'gpu': return
@@ -859,19 +940,19 @@ class Device(object):
     theano_func = self.get_compute_func(self.network_task)
     if not any([x.op.__class__.__name__ in ['GpuGemm', 'GpuGemv', 'GpuDot22', 'GpuElemwise']
                 for x in theano_func.maker.fgraph.toposort()]):
-      print >> log.v1, device + ":", "It seems as if we don't use the GPU although we requested it."
+      print(device + ":", "It seems as if we don't use the GPU although we requested it.", file=log.v1)
       import theano.printing
       theano.printing.debugprint(theano_func.maker.fgraph.outputs[0])
     else:
-      print >> log.v5, device + ":", "Our Theano trainer functions looks like it will run on the GPU."
+      print(device + ":", "Our Theano trainer functions looks like it will run on the GPU.", file=log.v5)
 
     try:
       import theano.sandbox.cuda
       theano_cuda = theano.sandbox.cuda.cuda_ndarray.cuda_ndarray
       devProps = theano_cuda.device_properties(device_id)
-      print >> log.v5, device + ":", "CUDA version %i" % devProps["driverVersion"]
+      print(device + ":", "CUDA version %i" % devProps["driverVersion"], file=log.v5)
     except Exception as exc:
-      print >> log.v3, device + ":", "Exception while getting CUDA information. %s" % exc
+      print(device + ":", "Exception while getting CUDA information. %s" % exc, file=log.v3)
 
   def process(self, asyncTask):
     """
@@ -889,20 +970,20 @@ class Device(object):
       rnn.initBetterExchook()
       rnn.config = config
       rnn.initLog()
-      print >> log.v3, "Device %s proc starting up, pid %i" % (device, os.getpid())
-      print >> log.v4, "Device %s proc: THEANO_FLAGS = %r" % (device, os.environ.get("THEANO_FLAGS", None))
+      print("Device %s proc starting up, pid %i" % (device, os.getpid()), file=log.v3)
+      print("Device %s proc: THEANO_FLAGS = %r" % (device, os.environ.get("THEANO_FLAGS", None)), file=log.v4)
       rnn.initFaulthandler()
       rnn.initConfigJsonNetwork()
       self.process_inner(device, config, self.update_specs, asyncTask)
     except ProcConnectionDied as e:
-      print >> log.v2, "Device %s proc, pid %i: Parent seem to have died: %s" % (device, os.getpid(), e)
+      print("Device %s proc, pid %i: Parent seem to have died: %s" % (device, os.getpid(), e), file=log.v2)
       sys.exit(1)
     except KeyboardInterrupt:
       # Killed by parent.
-      print >> log.v4, "Device %s proc got KeyboardInterrupt" % device
+      print("Device %s proc got KeyboardInterrupt" % device, file=log.v4)
       sys.exit(1)
     except Exception as e:
-      print >> log.v2, "Device %s proc exception: %s" % (device, e)
+      print("Device %s proc exception: %s" % (device, e), file=log.v2)
       sys.excepthook(*sys.exc_info())
       sys.exit(1)
 
@@ -917,6 +998,7 @@ class Device(object):
     if device[0:3] == 'gpu':
       import theano.sandbox.cuda
       if device == 'gpuX': device = 'gpu'
+      device = device.replace('gpu', 'cuda')
       #print "Use CUDA in device proc %s" % device
       assert theano.sandbox.cuda.cuda_available, "Theano CUDA support not available. Check that nvcc is in $PATH."
       if not theano.sandbox.cuda.cuda_enabled: # already enabled when $THEANO_FLAGS=device=gpu
@@ -948,7 +1030,7 @@ class Device(object):
     self.initialize(config, update_specs=update_specs)
     #self._checkGpuFuncs(device, device_id)
     output_queue.send(len(self.trainnet.train_params_vars))
-    print >> log.v4, "Device %s proc, pid %i is ready for commands." % (device, os.getpid())
+    print("Device %s proc, pid %i is ready for commands." % (device, os.getpid()), file=log.v4)
     network_params = []
     while True:
       cmd = input_queue.recv()
@@ -990,7 +1072,7 @@ class Device(object):
         for k in target_keys:
           self.j[k].set_value(self.output_index[k].astype('int8'), borrow = True)
         try:
-          utf8_tags = map(lambda s: s.encode('utf-8'), self.tags)
+          utf8_tags = [s.encode('utf-8') for s in self.tags]
         except Exception:
           utf8_tags = self.tags
         self.tags_var.set_value(numpy.array(utf8_tags).view(dtype='int8').reshape((len(utf8_tags), max(map(len, utf8_tags)))))
@@ -1042,7 +1124,7 @@ class Device(object):
         try:
           output, outputs_format = self.compute_run(task)
         except RuntimeError:
-          print >> log.v2, "warning: Runtime error on device", device_name
+          print("warning: Runtime error on device", device_name, file=log.v2)
           output_queue.send("error")
           sys.excepthook(*sys.exc_info())
           # If there are any other than the main thread.
@@ -1153,7 +1235,7 @@ class Device(object):
     """
     if self.is_device_proc():
       return  # Nothing to do.
-    self.used_data_keys = self._generic_exec_on_dev("_host__get_used_targets")
+    self.used_data_keys = self._generic_exec_on_dev("_host__get_used_targets")  # type: list[str]
 
   def alloc_data(self, shapes, max_ctc_length=0):
     """
@@ -1167,7 +1249,7 @@ class Device(object):
     self.targets = {k: numpy.full(shapes[k], -1, dtype=theano.config.floatX) for k in self.used_data_keys}
     self.ctc_targets = numpy.zeros((shapes.get('classes', [0,0])[1], max_ctc_length), dtype=theano.config.floatX)
     self.output_index = {k: numpy.zeros(shapes[k][0:2], dtype='int8') for k in self.used_data_keys}
-    self.tags = [None] * shapes["data"][1]  # seq-name for each batch slice
+    self.tags = [None] * shapes["data"][1]  # type: list[str]  # seq-name for each batch slice
 
   def update_data(self):
     # self.data is set in Engine.allocate_devices()
@@ -1231,8 +1313,8 @@ class Device(object):
     total_time = max(total_time, 0.001)
     compute_frac = self.compute_total_time / total_time
     update_frac = self.update_total_time / total_time
-    print >> log.v4, "Device %s proc epoch time stats: total %s, %.02f%% computing, %.02f%% updating data" % \
-                     (self.name, hms(total_time), compute_frac * 100, update_frac * 100)
+    print("Device %s proc epoch time stats: total %s, %.02f%% computing, %.02f%% updating data" % \
+                     (self.name, hms(total_time), compute_frac * 100, update_frac * 100), file=log.v4)
 
   def need_reinit(self, json_content, train_param_args=None):
     if self.config.bool('reinit', True) == False:
@@ -1242,13 +1324,13 @@ class Device(object):
       import json
       json_content = json.loads(json_content)
     if self.trainnet.to_json_content() != json_content:
-      print >> log.v3, "Device: reinit because network description differs. Diff:", \
-                       dict_diff_str(self.trainnet.to_json_content(), json_content)
+      print("Device: reinit because network description differs. Diff:", \
+                       dict_diff_str(self.trainnet.to_json_content(), json_content), file=log.v3)
       return True
     if train_param_args is None:
       train_param_args = self.trainnet.get_train_param_args_default()
     if self.trainnet.train_param_args != train_param_args:
-      print >> log.v3, "Device: reinit because network train params differ"
+      print("Device: reinit because network train params differ", file=log.v3)
       return True
     return False
 
@@ -1343,12 +1425,13 @@ class Device(object):
     self.result_called_count += 1
     if self.blocking:
       assert self.result_called_count == self.run_called_count
+      self.wait_for_result_call = False
       return self.output, self.outputs_format
     else:
       assert self.main_pid == os.getpid()
       assert self.result_called_count <= self.run_called_count
       if not self.proc.is_alive():
-        print >> log.v4, "Dev %s proc not alive anymore" % self.name
+        print("Dev %s proc not alive anymore" % self.name, file=log.v4)
         return None, None
       # 60 minutes execution timeout by default
       timeout = self.config.float("device_timeout", 60 * 60)
@@ -1357,7 +1440,7 @@ class Device(object):
           if self.output_queue.poll(1):
             r = self.output_queue.recv()
             if r == "error":
-              print >> log.v5, "Dev %s proc reported error" % self.name
+              print("Dev %s proc reported error" % self.name, file=log.v5)
               self.wait_for_result_call = False
               return None, None
             assert r == "task-result"
@@ -1368,15 +1451,15 @@ class Device(object):
             return output, outputs_format
         except ProcConnectionDied as e:
           # The process is dying or died.
-          print >> log.v4, "Dev %s proc died: %s" % (self.name, e)
+          print("Dev %s proc died: %s" % (self.name, e), file=log.v4)
           self.wait_for_result_call = False
           return None, None
         timeout -= 1
-      print >> log.v3, "Timeout (device_timeout = %s) expired for device %s" % (self.config.float("device_timeout", 60 * 60), self.name)
+      print("Timeout (device_timeout = %s) expired for device %s" % (self.config.float("device_timeout", 60 * 60), self.name), file=log.v3)
       try:
         os.kill(self.proc.proc.pid, signal.SIGUSR1)
       except Exception as e:
-        print >> log.v3, "os.kill SIGUSR1 exception: %s" % e
+        print("os.kill SIGUSR1 exception: %s" % e, file=log.v3)
       return None, None
 
   def forward(self, use_trainnet=False):
@@ -1384,7 +1467,7 @@ class Device(object):
     network = self.trainnet if use_trainnet else self.testnet
     import theano
     if not self.forwarder:
-      print >>log.v3, "Device: Create forwarder, use trainnet:", use_trainnet, ", testnet_share_params:", self.testnet_share_params
+      print("Device: Create forwarder, use trainnet:", use_trainnet, ", testnet_share_params:", self.testnet_share_params, file=log.v3)
       self.forwarder = theano.function(
         inputs=[],
         outputs=[layer.output for name, layer in sorted(network.output.items())],
@@ -1469,10 +1552,15 @@ class Device(object):
 
 
 def is_device_host_proc():
-  if not deviceInstance: return False
+  if not deviceInstance:
+    return False
   return deviceInstance.is_device_proc()
 
 def get_current_seq_tags():
+  """
+  :return: current seq tags (seq names) of current batch. assumes is_device_host_proc()
+  :rtype: list[str]
+  """
   assert deviceInstance, "get_current_seq_tags: deviceInstance not set"
   return deviceInstance.tags
 

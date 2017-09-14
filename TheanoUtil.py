@@ -102,6 +102,44 @@ def delta_batch(source, window):
   return w[1:] - w[:-1]
 
 
+def context_batched(source, window):
+  """
+  same as windowed_batch but with window center at the end of the window
+  :param theano.TensorVariable source: 3d tensor of shape (n_time, n_batch, n_dim)
+  :param int|theano.Variable window: window size
+  :return: tensor of shape (n_time, n_batch, window * n_dim)
+  """
+  assert source.ndim == 3  # (time,batch,dim). not sure how to handle other cases
+  n_time = source.shape[0]
+  n_batch = source.shape[1]
+  n_dim = source.shape[2]
+  w_left = window - 1
+  pad_left = T.zeros((w_left, n_batch, n_dim), dtype=source.dtype)
+  padded = T.concatenate([pad_left, source], axis=0)  # shape[0] == n_time + window - 1
+  tiled = T.tile(padded, (1, 1, window))  # shape[2] == n_dim * window
+  tiled_reshape = T.reshape(tiled, ((n_time + window - 1), n_batch, window, n_dim))
+  # We want to shift every dim*time block by one to the left.
+  # To do this, we interpret that we have one more time frame (i.e. n_time+window).
+  # We have to do some dimshuffling so that we get the right layout, then we can flatten,
+  # add some padding, and then dimshuffle it back.
+  # Then we can take out the first n_time frames.
+  tiled_dimshuffle = tiled_reshape.dimshuffle(2, 0, 1, 3)  # (window,n_time+window-1,batch,dim)
+  tiled_flat = T.flatten(tiled_dimshuffle)
+  rem = n_batch * n_dim * window
+  tiled_flat_pad_right = T.concatenate([tiled_flat, T.zeros((rem,), dtype=source.dtype)])
+  tiled_reshape_shift = T.reshape(tiled_flat_pad_right, (window, n_time + window, n_batch, n_dim))  # add time frame
+  final_dimshuffle = tiled_reshape_shift.dimshuffle(1, 2, 0, 3)  # (n_time+window,batch,window,dim)
+  final_sub = final_dimshuffle[:n_time]  # (n_time,batch,window,dim)
+  final_concat_dim = final_sub.reshape((n_time, n_batch, window * n_dim))
+  return final_concat_dim
+
+def window_batch_timewise(t,b,w,full_index):
+  for i in range(w):
+    full_index = T.set_subtensor(full_index[i], T.roll(full_index[i], i))
+    if i > 0:
+      full_index = T.inc_subtensor(full_index[i], T.where(full_index[i] > 0, i * t * b - i, 0))
+  return full_index
+
 def slice_for_axis(axis, s):
   return (slice(None),) * axis + (s,)
 
@@ -111,10 +149,10 @@ def downsample(source, axis, factor, method="average"):
   factor = int(factor)
   # make shape[axis] a multiple of factor
   src = source
-  source = source[slice_for_axis(axis=axis, s=slice(0, (source.shape[axis] / factor) * factor))]
+  source = source[slice_for_axis(axis=axis, s=slice(0, (source.shape[axis] // factor) * factor))]
   # Add a temporary dimension as the factor.
   added_dim_shape = [source.shape[i] for i in range(source.ndim)]
-  added_dim_shape = added_dim_shape[:axis] + [source.shape[axis] / factor, factor] + added_dim_shape[axis + 1:]
+  added_dim_shape = added_dim_shape[:axis] + [source.shape[axis] // factor, factor] + added_dim_shape[axis + 1:]
   if method == "lstm":
     assert axis == 0
     return source
@@ -152,7 +190,8 @@ def upsample(source, axis, factor, method="nearest-neighbor", target_axis_len=No
 def pad(source, axis, target_axis_len, pad_value=None):
   if pad_value is None:
     pad_value = T.zeros([source.shape[i] if i != axis else 1 for i in range(source.ndim)], dtype=source.dtype)
-  num_missing = T.cast(target_axis_len, dtype="int32") - source.shape[axis]
+  target_axis_len = T.cast(target_axis_len, dtype="int32")
+  num_missing = target_axis_len - source.shape[axis]
   # There is some strange bug in Theano. If num_missing is 0, in some circumstances,
   # it crashes with Floating point exception.
   # Thus, do this workaround.
@@ -173,7 +212,7 @@ def chunked_time_reverse(source, chunk_size):
   (Padded with 0, recovers original size.)
   """
   chunk_size = T.cast(chunk_size, dtype="int32")
-  num_chunks = (source.shape[0] + chunk_size - 1) / chunk_size
+  num_chunks = (source.shape[0] + chunk_size - 1) // chunk_size
   needed_time = num_chunks * chunk_size
   remaining_dims = [source.shape[i + 1] for i in range(source.ndim - 1)]
   padded_source = pad(source, axis=0, target_axis_len=needed_time)
@@ -657,7 +696,7 @@ class DumpOp(theano.Op):
     dout = T.as_tensor_variable(dout)
     if self.with_grad:
       # Note: This assumes that there will be only one such gradient.
-      dout = DumpOp(filename=self.filename + ".grad", parent=self, container=self.container)(dout)
+      dout = DumpOp(filename=self.filename + ".grad", container=self.container, parent=self, step=self.step)(dout)
     return [dout]
 
   def dump(self, x):
@@ -721,15 +760,20 @@ def layer_normalization(x, bias=None, scale=None, eps=1e-5):
   return output
 
 
-def print_to_file(filename, x, argmax=False, shape=False):
+def print_to_file(filename, x, argmax=None, sum=None, shape=False):
   def theano_print_to_file(op,x):
     with open(filename, 'a') as f:
-      if argmax:
-        f.write(str(x.argmax(axis=-1)) + '\n')
+      if argmax is not None:
+        f.write(str(x.argmax(axis=argmax)) + '\n')
+      elif sum is not None:
+        f.write(str(x.sum(axis=sum)) + '\n')
       elif shape:
         f.write(str(x.shape) + '\n')
       else:
+        #opt = numpy.get_printoptions()
+        #numpy.set_printoptions(threshold='nan')
         f.write(str(x) + '\n')
+        #numpy.set_printoptions(opt)
   return theano.printing.Print(global_fn=theano_print_to_file)(x)
 
 

@@ -1,9 +1,12 @@
-
+import collections
 import gc
 import h5py
 import numpy
+import random
 import theano
 from CachedDataset import CachedDataset
+from CachedDataset2 import CachedDataset2
+from Dataset import Dataset, DatasetSeq
 from Log import log
 
 # Common attribute names for HDF dataset, which should be used in order to be proceed with HDFDataset class.
@@ -36,12 +39,12 @@ class HDFDataset(CachedDataset):
     """
     fin = h5py.File(filename, "r")
     if 'targets' in fin:
-      self.labels = { k : [ item.split('\0')[0] for item in fin["targets/labels"][k][...].tolist() ] for k in fin['targets/labels'] }
+      self.labels = { k : [ item.decode("utf8").split('\0')[0] for item in fin["targets/labels"][k][...].tolist() ] for k in fin['targets/labels'] }
     if not self.labels:
       labels = [ item.split('\0')[0] for item in fin["labels"][...].tolist() ]; """ :type: list[str] """
       self.labels = { 'classes' : labels }
       assert len(self.labels['classes']) == len(labels), "expected " + str(len(self.labels['classes'])) + " got " + str(len(labels))
-    tags = [ item.split('\0')[0] for item in fin["seqTags"][...].tolist() ]; """ :type: list[str] """
+    tags = [ item.decode("utf8").split('\0')[0] for item in fin["seqTags"][...].tolist() ]; """ :type: list[str] """
     self.files.append(filename)
     if 'times' in fin:
       self.timestamps.extend(fin[attr_times][...].tolist())
@@ -104,7 +107,6 @@ class HDFDataset(CachedDataset):
       for name in fin['targets/data']:
         tdim = 1 if len(fin['targets/data'][name].shape) == 1 else fin['targets/data'][name].shape[1]
         self.data_dtype[name] = str(fin['targets/data'][name].dtype) if tdim > 1 else 'int32'
-        #print name, self.data_dtype[name], fin['targets/data'][name][0:3][...]
         if self.data_dtype[name] == 'int32':
           self.targets[name] = numpy.zeros((self._num_codesteps[self.target_keys.index(name)],), dtype=theano.config.floatX) - 1
         else:
@@ -148,7 +150,7 @@ class HDFDataset(CachedDataset):
         if 'targets' in fin:
           for k in fin['targets/data']:
             ldx = self.target_keys.index(k) + 1
-            self.targets[k][self.get_seq_start(idc)[ldx]:self.get_seq_start(idc)[ldx] + l[ldx]] = fin['targets/data/' + k][p[ldx] : p[ldx] + l[ldx]][...]
+            self.targets[k][self.get_seq_start(idc)[ldx]:self.get_seq_start(idc)[ldx] + l[ldx]] = fin['targets/data/' + k][p[ldx] : p[ldx] + l[ldx]] #[...]
         self._set_alloc_intervals_data(idc, data=fin['inputs'][p[0] : p[0] + l[0]][...])
       fin.close()
     gc.collect()
@@ -172,3 +174,158 @@ class HDFDataset(CachedDataset):
     return ", ".join(["HDF dataset",
                       "sequences: %i" % self.num_seqs,
                       "frames: %i" % self.get_num_timesteps()])
+
+# ------------------------------------------------------------------------------
+
+class StreamParser(object):
+  def __init__(self, seq_names, stream):
+    self.seq_names = seq_names
+    self.stream = stream
+
+    self.num_features = None
+    self.feature_type = None  # 1 for sparse, 2 for dense
+
+  def get_data(self, seq_name):
+    raise NotImplementedError()
+
+  def get_seq_length(self, seq_name):
+    raise NotImplementedError()
+
+
+class FeatureSequenceStreamParser(StreamParser):
+  def __init__(self, *args, **kwargs):
+    super(FeatureSequenceStreamParser, self).__init__(*args, **kwargs)
+
+    for s in self.seq_names:
+      seq_data = self.stream['data'][s]
+      assert len(seq_data.shape) == 2
+
+      if self.num_features is None:
+        self.num_features = seq_data.shape[1]
+
+      assert seq_data.shape[1] == self.num_features
+
+    self.feature_type = 2
+
+  def get_data(self, seq_name):
+    return self.stream['data'][seq_name][...]
+
+  def get_seq_length(self, seq_name):
+    return self.stream['data'][seq_name].shape[0]
+
+
+class SparseStreamParser(StreamParser):
+  def __init__(self, *args, **kwargs):
+    super(SparseStreamParser, self).__init__(*args, **kwargs)
+
+    for s in self.seq_names:
+      seq_data = self.stream['data'][s]
+      assert len(seq_data.shape) == 1
+
+    self.num_features = self.stream['feature_names'].shape[0]
+    self.feature_type = 1
+
+  def get_data(self, seq_name):
+    return self.stream['data'][seq_name][:]
+
+  def get_seq_length(self, seq_name):
+    return self.stream['data'][seq_name].shape[0]
+
+
+class NextGenHDFDataset(CachedDataset2):
+  """
+  """
+
+  parsers = { 'feature_sequence' : FeatureSequenceStreamParser,
+              'sparse'           : SparseStreamParser }
+
+  def __init__(self, input_stream_name, *args, **kwargs):
+    super(NextGenHDFDataset, self).__init__(*args, **kwargs)
+
+    self.input_stream_name = input_stream_name
+
+    self.files           = []
+    self.h5_files        = []
+    self.all_seq_names   = []
+    self.seq_name_to_idx = {}
+    self.file_indices    = []
+    self.seq_order       = []
+    self.all_parsers     = collections.defaultdict(list)
+
+
+  def add_file(self, path):
+    self.files.append(path)
+    self.h5_files.append(h5py.File(path))
+
+    cur_file = self.h5_files[-1]
+
+    assert {'seq_names', 'streams'}.issubset(set(cur_file.keys())), "%s does not contain all required datasets/groups" % path
+
+    seqs = list(cur_file['seq_names'])
+
+    prev_no_seqs      = len(self.all_seq_names)
+    seqs_in_this_file = len(seqs)
+    self.seq_name_to_idx.update(zip(seqs, range(prev_no_seqs, prev_no_seqs + seqs_in_this_file + 1)))
+
+    self.all_seq_names.extend(seqs)
+    self.file_indices.extend([len(self.files) - 1] * len(seqs))
+
+    all_streams = set(cur_file['streams'].keys())
+    assert self.input_stream_name in all_streams, "%s does not contain the input stream %s" % (path, self.input_stream)
+
+    parsers = { name : NextGenHDFDataset.parsers[stream.attrs['parser']](seqs, stream) for name, stream in cur_file['streams'].items()}
+    for k, v in parsers.items():
+      self.all_parsers[k].append(v)
+
+    if len(self.files) == 1:
+      self.num_outputs = { name : [parser.num_features, parser.feature_type] for name, parser in parsers.items() }
+      self.num_inputs = self.num_outputs[self.input_stream_name][0]
+    else:
+      assert all(self.num_outputs[name] == parser.num_features for name, parser in parsers.items())
+
+
+  def initialize(self):
+    super(NextGenHDFDataset, self).initialize()
+
+    self._num_seqs           = len(self.all_seq_names)
+    self._estimated_num_seqs = self._num_seqs
+
+
+  def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :type epoch: int|None
+    :param list[str] | None seq_list: In case we want to set a predefined order.
+    """
+    super(NextGenHDFDataset, self).init_seq_order(epoch, seq_list)
+
+    if seq_list is not None:
+      self.seq_order = [self.seq_name_to_idx[s] for s in seq_list]
+    else:
+      self.seq_order = self.get_seq_order_for_epoch(epoch, len(self.all_seq_names), self._get_seq_length)
+
+  def _get_seq_length(self, orig_seq_idx):
+    """
+    :type orig_seq_idx: int
+    :rtype int
+    """
+    parser = self.all_parsers[self.input_stream_name][self.file_indices[orig_seq_idx]]
+    return parser.get_seq_length(self.all_seq_names[orig_seq_idx])
+
+
+  def _collect_single_seq(self, seq_idx):
+    """
+    :type seq_idx: int
+    :rtype: DatasetSeq
+    """
+    if seq_idx >= len(self.seq_order):
+      return None
+
+    real_seq_index = self.seq_order[seq_idx]
+    file_index     = self.file_indices[real_seq_index]
+    seq_name       = self.all_seq_names[real_seq_index]
+    targets        = { name : parsers[file_index].get_data(seq_name) for name, parsers in self.all_parsers.items() }
+    features       = targets[self.input_stream_name]
+    return DatasetSeq(seq_idx=seq_idx,
+                      seq_tag=seq_name,
+                      features=features,
+                      targets=targets)

@@ -1,6 +1,8 @@
 
+from __future__ import print_function
+
 import os
-from Util import betterRepr, simpleObjRepr, ObjAsDict
+from Util import betterRepr, simpleObjRepr, ObjAsDict, unicode
 from Log import log
 import numpy
 
@@ -79,12 +81,12 @@ class LearningRateControl(object):
     self.filename = filename
     if filename:
       if os.path.exists(filename):
-        print >> log.v4, "Learning-rate-control: loading file %s" % filename
+        print("Learning-rate-control: loading file %s" % filename, file=log.v4)
         self.load()
       else:
-        print >> log.v4, "Learning-rate-control: file %s does not exist yet" % filename
+        print("Learning-rate-control: file %s does not exist yet" % filename, file=log.v4)
     else:
-      print >> log.v4, "Learning-rate-control: no file specified, not saving history (no proper restart possible)"
+      print("Learning-rate-control: no file specified, not saving history (no proper restart possible)", file=log.v4)
 
   __repr__ = simpleObjRepr
 
@@ -175,7 +177,7 @@ class LearningRateControl(object):
     :type error: dict[str,float|dict[str,float]]
     """
     if epoch not in self.epochData:
-      print >> log.v4, "Learning rate not set for epoch %i. Assuming default." % epoch
+      print("Learning rate not set for epoch %i. Assuming default." % epoch, file=log.v4)
       self.getLearningRateForEpoch(epoch)  # This will set it.
     assert isinstance(error, dict)
     error = error.copy()
@@ -183,7 +185,7 @@ class LearningRateControl(object):
       if isinstance(v, dict):  # like error = {"dev_score": {"cost:output1": .., "cost:output2": ...}, ...}
         del error[k]
         if len(v) == 1:
-          error[k] = v.values()[0]
+          error[k] = list(v.values())[0]
           continue
         for k1, v1 in v.items():
           if ":" in k1: k1 = k1[k1.index(":") + 1:]
@@ -192,7 +194,7 @@ class LearningRateControl(object):
       assert isinstance(v, float)
     self.epochData[epoch].error.update(error)
     if epoch == 1:
-      print >> log.v4, "Learning-rate-control: error key %r from %r" % (self.getErrorKey(epoch), error)
+      print("Learning-rate-control: error key %r from %r" % (self.getErrorKey(epoch), error), file=log.v4)
 
   def getErrorKey(self, epoch):
     if epoch not in self.epochData:
@@ -226,6 +228,35 @@ class LearningRateControl(object):
     assert key in error, "%r not in %r. fix %r in config. set it to %r or so." % \
                          (key, error, 'learning_rate_control_error_measure', 'dev_error')
     return error[key]
+
+  def getLastBestEpoch(self, last_epoch, first_epoch=1, filter_score=float("inf"), only_last_n=-1, min_score_dist=0.0):
+    """
+    :param int first_epoch: will check all epochs >= first_epoch
+    :param int last_epoch: will check all epochs <= last_epoch
+    :param float filter_score: all epochs which values over this score are not considered
+    :param int only_last_n: if set, from the resulting list, we consider only the last only_last_n
+    :param float min_score_dist: filter out epochs where the diff to the most recent is not big enough
+    :return: the last best epoch. to get the details then, you might want to use getEpochErrorDict.
+    :rtype: int|None
+    """
+    if first_epoch > last_epoch:
+      return None
+    values = [(self.getEpochErrorValue(ep), ep) for ep in range(first_epoch, last_epoch + 1)]
+    # Note that the order of the checks here is a bit arbitrary but I had some thoughts on it.
+    # Changing the order will also slightly change the behavior, so be sure it make sense.
+    values = [(v, ep) for (v, ep) in values if v is not None]
+    if not values:
+      return None
+    latest_score = values[-1][0]
+    values = [(v, ep) for (v, ep) in values if v <= filter_score]
+    if not values:
+      return None
+    if only_last_n >= 1:
+      values = values[-only_last_n:]
+    values = [(v, ep) for (v, ep) in values if v + min_score_dist < latest_score]
+    if not values:
+      return None
+    return min(values)[1]
 
   def save(self):
     if not self.filename: return
@@ -399,6 +430,11 @@ class NewbobMultiEpoch(LearningRateControl):
     self.learningRateDecayFactor = learningRateDecayFactor
 
   def _calcMeanRelativeError(self, epochs):
+    """
+    :param list[int] epochs:
+    :return: mean of relative errors
+    :rtype: float|None
+    """
     assert len(epochs) >= 2
     errors = [self.calcRelativeError(epochs[i], epochs[i + 1]) for i in range(len(epochs) - 1)]
     if any([e is None for e in errors]):
@@ -406,13 +442,18 @@ class NewbobMultiEpoch(LearningRateControl):
     return numpy.mean(errors)
 
   def _calcRecentMeanRelativeError(self, epoch):
+    """
+    :param int epoch:
+    :return: recent mean of relative errors
+    :rtype: float|None
+    """
     # Take one more than numEpochs because we are looking at the diffs.
     lastEpochs = self._lastEpochsForEpoch(epoch, numEpochs=self.numEpochs + 1)
     if not lastEpochs:
       return None
     # We could also use the self.numEpochs limit here. But maybe this is better.
     if len(lastEpochs) <= 1:
-      return []
+      return None
     return self._calcMeanRelativeError(lastEpochs)
 
   def calcLearningRateForEpoch(self, epoch):
@@ -463,10 +504,14 @@ def demo():
   import rnn
   import sys
   if len(sys.argv) <= 1:
-    print("usage: python %s [config] [other options]" % __file__)
+    print("usage: python %s [config] [other options] [++check_learning_rates 1]" % __file__)
     print("example usage: python %s ++learning_rate_control newbob ++learning_rate_file newbob.data ++learning_rate 0.001" % __file__)
   rnn.initConfig(commandLineOptions=sys.argv[1:])
   rnn.config._hack_value_reading_debug()
+  rnn.config.update({"log": []})
+  rnn.initLog()
+  rnn.initBackendEngine()
+  check_lr = rnn.config.bool("check_learning_rates", False)
   from Pretrain import pretrainFromConfig
   pretrain = pretrainFromConfig(rnn.config)
   first_non_pretrain_epoch = 1
@@ -506,6 +551,10 @@ def demo():
     if hasattr(control, "_calcRecentMeanRelativeError"):
       s += ", previous mean relative error: %s" % control._calcRecentMeanRelativeError(epoch)
     print(s)
+    if check_lr and oldLearningRate is not None:
+      if oldLearningRate != learningRate:
+        print("Learning rate is different in epoch %i!" % epoch)
+        sys.exit(1)
     # Overwrite new learning rate so that the calculation for further learning rates stays consistent.
     if epoch in control.epochData:
       control.epochData[epoch].learningRate = learningRate

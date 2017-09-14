@@ -16,7 +16,7 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from NetworkHiddenLayer import _NoOpLayer
 from ActivationFunctions import strtoact
 from cuda_implementation.FractionalMaxPoolingOp import fmp
-
+from theano.sandbox.cuda import dnn
 
 class CNN(_NoOpLayer):
   recurrent = True
@@ -27,61 +27,63 @@ class CNN(_NoOpLayer):
                activation="tanh", dropout=0.0, factor=1.0, base = None, transpose=False,
                force_sample=False, **kwargs):
     """
-      :param n_features: integer
+      :param int n_features: integer
         the number of feature map(s), e.g. 32, 64, or so on.
+        the input will be interpret as (width|time, batch, height * n_in_features) and
+        the output will be (width|time, batch, height * n_features).
 
-      :param filter: integer or tuple of length 2
-        the number of row(s) and/or columns(s) from the filter shape
+      :param int|(int,int) filter: integer or tuple of length 2
+        the filter size/shape, i.e. the number of row(s) and/or columns(s) from the filter shape.
         when this filter type is integer, it means the number of rows the same as the number of columns.
         e.g. 3, 5, (1,3), or so on.
 
-      :param d_row: integer
+      :param int d_row: integer
         the number of row(s) from the input
         the default value is -1, which the dimension comes from the n_out of the input.
         otherwise, this has to be filled only for the first convolutional layer and
         the rest layer will use the number of rows from the previous layer.
 
-      :param border_mode: string
+      :param str border_mode: string
         "valid" --  only apply filter to complete patches of the image.
                     Generates output of shape: (image_shape - filter_shape + 1).
         "full"  --  zero-pads image to multiple of filter shape to generate output of shape: (image_shape + filter_shape - 1).
         "same"  --  keep the dimension of convolutional layer output the same as the input dimension.
 
-      :param conv_stride: tuple of length 2
+      :param (int,int) conv_stride: tuple of length 2
         factor by which to subsample the convolutional layer output.
         this stride is writen in (rows,columns).
 
-      :param pool_size: tuple of length 2
+      :param (int,int) pool_size: tuple of length 2
         factor by which to downscale in pooling layer.
         this is written in (rows,columns).
         the default value is (2,2), it will halve the input in each dimension.
 
-      :param filter_dilation: tuple of length 2
+      :param (int,int) filter_dilation: tuple of length 2
         factor by which to subsample (stride) the convolutional layer input.
 
-      :param ignore_border: integer or boolean
+      :param int|bool ignore_border: integer or boolean
         1 or True  -- (5, 5) input with pool_size = (2, 2), will generate a (2, 2) pooling layer output.
         0 or False -- (5, 5) input with pool_size = (2, 2), will generate a (3, 3) pooling layer output.
 
-      :param pool_stride: tuple of length 2
+      :param (int,int) pool_stride: tuple of length 2
         stride size, which is the number of shifts over rows/cols to get the next pool region.
         the default value is 0, it will set equal to pool_size, which means no overlap on pooling regions.
 
-      :param pool_padding: tuple of length 2
+      :param (int,int) pool_padding: tuple of length 2
         pad zeros to extend beyond four borders of the images.
         this is writen in (pad_h,pad_w), where pad_h is the size of the top and bottom margins, and pad_w is the size of the left and right margins.
 
-      :param mode: string
+      :param str mode: string
         pooling layer mode that excludes the padding in the computation.
         "max" --  max pooling
         "sum" --  sum pooling
         "avg" --  average pooling
         "fmp" --  fractional max pooling
 
-      :param activation: string
+      :param str activation: string
         activation function, e.g. "tanh", "sigmoid", "relu", "elu", "maxout", and so on.
 
-      :param factor: float
+      :param float factor: float
         factor by which scale the initial weights
     """
 
@@ -114,7 +116,7 @@ class CNN(_NoOpLayer):
         if d_row == -1:
           d_row = dimension
         else:
-          stack_size = dimension
+          stack_size = dimension / d_row
       elif d_row == -1:
         d_row = int(sqrt(dimension))
 
@@ -246,6 +248,7 @@ class CNN(_NoOpLayer):
 
     W_bound = numpy.sqrt(6. / (fan_in + fan_out)) * factor
     if self.base:
+      #W = self.base[0].W
       W = self.add_param(self.base[0].W)
     else:
       W = self.add_param(
@@ -259,6 +262,7 @@ class CNN(_NoOpLayer):
         )
       )
     self.W = W
+
     if self.transpose:
       op = T.nnet.abstract_conv.AbstractConv2d_gradInputs(
         imshp=inputs.shape,
@@ -311,6 +315,7 @@ class CNN(_NoOpLayer):
 
   def bias_term(self, inputs, n_features, activation):
     if self.base:
+      #b = self.base[0].b
       b = self.add_param(self.base[0].b)
     else:
       b = self.add_param(
@@ -367,9 +372,13 @@ class NewConv(CNN):
     if self.status[0]:  # the previous layer is convolutional layer
       self.input = T.concatenate([s.Output for s in self.sources], axis=1)  # (batch, stack size, row, col)
     else:
-      inputs2 = inputs.reshape((time * batch, self.input_shape[0],
-                                self.input_shape[1], self.filter_shape[1]))  # (time*batch, row, col, stack)
-      self.input = inputs2.dimshuffle(0, 3, 1, 2)  # (batch, stack_size, row, col)
+      # In case of spliced data, the last dim in inputs contains stacked frames (e.g. ASR).
+      # Since Theano reshape will read _and_ write elements row-wise, we need to transpose the target matrix.
+      # This is done by swapping target dimensions (reshape(.., input_shape[1], input_shape[0]) and subsequent
+      # dimshuffle that puts row and col dim where Theano expects them.
+      inputs2 = inputs.reshape((time * batch, self.input_shape[1],
+                                self.input_shape[0], self.filter_shape[1]))  # (time*batch, row, col, stack)
+      self.input = inputs2.dimshuffle(0, 3, 2, 1)  # (batch, stack_size, row, col)
     self.input.name = "conv_layer_input_final"
 
     if self.modes[3] != "tanh":
@@ -417,7 +426,7 @@ class ConcatConv(CNN):
     this class is for the CNN that processes an entire line image as the input by concatenated several frames by time axis.
   '''
 
-  def __init__(self, **kwargs):
+  def __init__(self, padding=False, **kwargs):
     super(ConcatConv, self).__init__(**kwargs)
 
     inputs = T.concatenate([s.output for s in self.sources], axis=2)  # (time, batch, input-dim = row * features)
@@ -435,7 +444,7 @@ class ConcatConv(CNN):
       self.input = inputs2.dimshuffle(1, 3, 2, 0)  # (batch, stack_size, row, time)
     self.input.name = "conv_layer_input_final"
 
-    if self.pool_params[0][1] > 1:
+    if self.pool_params[0][1] > 1 and padding:
       xp = T.constant(self.pool_params[0][1], 'int32')
       self.input = T.concatenate([self.input, T.zeros((batch, self.filter_shape[1], self.input.shape[2],
                                                        xp - T.mod(self.input.shape[3], xp)), 'float32')], axis=3)
@@ -527,4 +536,3 @@ class ResNet(CNN):
 
     output2 = self.Output.dimshuffle(0, 2, 3, 1)  # (time*batch, out-row, out-col, nb feature maps)
     self.output = output2.reshape((time, batch, output2.shape[1] * output2.shape[2] * output2.shape[3]))  # (time, batch, out-dim)
-

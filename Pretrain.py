@@ -1,9 +1,11 @@
 
+from __future__ import print_function
+
 from Network import LayerNetwork
 from NetworkBaseLayer import Layer
 from NetworkCopyUtils import intelli_copy_layer, LayerDoNotMatchForCopy
 from Log import log
-from Util import unicode
+from Util import unicode, long
 
 
 class WrapEpochValue:
@@ -368,11 +370,11 @@ class Pretrain:
           intelli_copy_layer(old_network.output[layer_name], new_network.output[layer_name])
         except LayerDoNotMatchForCopy:
           if self.copy_output_layer == "ifpossible":
-            print >>log.v4, "Pretrain: Can not copy output layer %s, will leave it randomly initialized" % layer_name
+            print("Pretrain: Can not copy output layer %s, will leave it randomly initialized" % layer_name, file=log.v4)
           else:
             raise
     else:
-      print >>log.v4, "Pretrain: Will not copy output layer"
+      print("Pretrain: Will not copy output layer", file=log.v4)
 
   def get_train_param_args_for_epoch(self, epoch):
     """
@@ -430,6 +432,9 @@ def demo():
     print("example usage: python %s ++pretrain default ++pretrain_construction_algo from_input" % __file__)
   rnn.initConfig(commandLineOptions=sys.argv[1:])
   rnn.config._hack_value_reading_debug()
+  rnn.config.update({"log": []})
+  rnn.initLog()
+  rnn.initBackendEngine()
   if not rnn.config.value("pretrain", ""):
     print("config option 'pretrain' not set, will set it for this demo to 'default'")
     rnn.config.set("pretrain", "default")
